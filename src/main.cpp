@@ -161,6 +161,43 @@ static void drawThickLine(SDL_Renderer* r, float x1, float y1, float x2, float y
     }
 }
 
+// Filled triangle via SDL_RenderGeometry (SDL 2.0.18+).
+static void fillTriangle(SDL_Renderer* r, float ax, float ay, float bx, float by,
+                         float cx, float cy, SDL_Color color) {
+    SDL_Vertex v[3];
+    v[0].position = {ax, ay}; v[0].color = color; v[0].tex_coord = {0, 0};
+    v[1].position = {bx, by}; v[1].color = color; v[1].tex_coord = {0, 0};
+    v[2].position = {cx, cy}; v[2].color = color; v[2].tex_coord = {0, 0};
+    SDL_RenderGeometry(r, nullptr, v, 3, nullptr, 0);
+}
+
+// Draw an arrow from (x1,y1) toward (x2,y2). The tip sits `tipInset`
+// pixels short of (x2,y2) so it lands on the target node's border
+// instead of vanishing inside the disc.
+static void drawArrow(SDL_Renderer* r, float x1, float y1, float x2, float y2,
+                      float tipInset, int shaftThickness, float headLen,
+                      float headHalfWidth, SDL_Color color) {
+    float dx = x2 - x1, dy = y2 - y1;
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len < tipInset + 1.f) return;
+    float ux = dx / len, uy = dy / len;          // unit direction
+    float px = -uy,      py = ux;                // perpendicular
+    float tipX = x2 - ux * tipInset;
+    float tipY = y2 - uy * tipInset;
+    float baseX = tipX - ux * headLen;
+    float baseY = tipY - uy * headLen;
+
+    // shaft stops at the arrowhead base so the head paints cleanly on top.
+    SDL_SetRenderDrawColor(r, color.r, color.g, color.b, color.a);
+    drawThickLine(r, x1, y1, baseX, baseY, shaftThickness);
+
+    fillTriangle(r,
+        tipX, tipY,
+        baseX + px * headHalfWidth, baseY + py * headHalfWidth,
+        baseX - px * headHalfWidth, baseY - py * headHalfWidth,
+        color);
+}
+
 struct TextCache {
     SDL_Renderer* renderer;
     TTF_Font* font;
@@ -483,13 +520,19 @@ int main(int argc, char** argv) {
             hovered = pickNode(mx, my);
         }
 
-        // edges
-        SDL_SetRenderDrawColor(ren, colEdge.r, colEdge.g, colEdge.b, colEdge.a);
-        for (auto& e : g.edges) {
-            float ax, ay, bx, by;
-            worldToScreen(g.nodes[e.a].x, g.nodes[e.a].y, ax, ay);
-            worldToScreen(g.nodes[e.b].x, g.nodes[e.b].y, bx, by);
-            drawThickLine(ren, ax, ay, bx, by, 2);
+        // edges (drawn as arrows that stop at the target node's border)
+        {
+            float inset      = sim.nodeRadius * zoom + 1.f;
+            float headLen    = std::max(8.f, 9.f * zoom);
+            float headHalfW  = std::max(4.f, 5.f * zoom);
+            int   shaftThick = std::max(1, (int)std::round(2.f * std::min(zoom, 1.5f)));
+            for (auto& e : g.edges) {
+                float ax, ay, bx, by;
+                worldToScreen(g.nodes[e.a].x, g.nodes[e.a].y, ax, ay);
+                worldToScreen(g.nodes[e.b].x, g.nodes[e.b].y, bx, by);
+                drawArrow(ren, ax, ay, bx, by,
+                          inset, shaftThick, headLen, headHalfW, colEdge);
+            }
         }
 
         // nodes
