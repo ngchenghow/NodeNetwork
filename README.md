@@ -75,6 +75,17 @@ cmake --build build -j
 ./build/NodeNetwork path/to/my.txt   # load a custom graph
 ```
 
+On Windows / MinGW the build automatically copies the SDL2 + GCC runtime
+DLLs next to `NodeNetwork.exe`, so you can double-click it or move the
+`build/` folder anywhere. To skip the gather step, pass
+`-DNODENETWORK_GATHER_DLLS=OFF` to `cmake`. To run the gather manually:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+    -File scripts\gather_dlls.ps1 `
+    -Exe build\NodeNetwork.exe
+```
+
 The program searches for a TTF font in this order:
 
 1. `assets/font.ttf` (drop one here to bundle)

@@ -59,3 +59,22 @@ endif()
 add_custom_command(TARGET NodeNetwork POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:NodeNetwork>/assets")
+
+# On MinGW builds, gather the runtime DLLs next to the exe so it can be
+# launched from Explorer or shipped without depending on PATH containing
+# C:\msys64\mingw64\bin. Set NODENETWORK_GATHER_DLLS=OFF to skip.
+option(NODENETWORK_GATHER_DLLS "Copy MinGW runtime DLLs next to the binary" ON)
+if(WIN32 AND MINGW AND NODENETWORK_GATHER_DLLS)
+    find_program(POWERSHELL_EXE NAMES pwsh.exe powershell.exe)
+    if(POWERSHELL_EXE)
+        add_custom_command(TARGET NodeNetwork POST_BUILD
+            COMMAND ${POWERSHELL_EXE} -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_SOURCE_DIR}/scripts/gather_dlls.ps1"
+                    -Exe "$<TARGET_FILE:NodeNetwork>"
+            COMMENT "Gathering MinGW runtime DLLs"
+            VERBATIM)
+    else()
+        message(WARNING "PowerShell not found; skipping DLL gather. "
+                        "Run scripts/gather_dlls.ps1 manually.")
+    endif()
+endif()
