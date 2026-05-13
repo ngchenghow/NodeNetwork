@@ -7,22 +7,31 @@ Inspired by [Obsidian-Node-Network](https://github.com/ngchenghow/Obsidian-Node-
 
 ## Graph syntax
 
-Each line in `assets/graph.txt` is one of:
+Every token on a line is a node. Consecutive tokens become an edge, so
+**relationships are first-class nodes** — `bird->color->red` produces
+three nodes (`bird`, `color`, `red`) connected as `bird → color → red`.
+Repeating the same token (e.g. `color` in multiple lines) merges into a
+single hub node.
 
 | form | meaning |
 | --- | --- |
-| `a->p->b` | edge from `a` to `b` labeled `p` |
-| `a->b`   | unlabeled edge from `a` to `b` |
-| `a->b->c->d` | chain — consecutive pairs become edges |
+| `a->b` | edge from `a` to `b` |
+| `a->p->b` | three nodes connected as `a → p → b` |
+| `a->b->c->d` | chain of edges `a → b → c → d` |
 | `# ...` or `// ...` | comment |
 
 Example:
 
 ```
 bird->color->red
+bird->color->black
 bird->name->crow
 crow->eats->seeds
 ```
+
+In the example above `color`, `name`, and `eats` each become their own
+node, which lets relationship nodes attract their participants and act
+as visible hubs in the layout.
 
 ## Controls
 

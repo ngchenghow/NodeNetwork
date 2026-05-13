@@ -1,8 +1,9 @@
 # NodeNetwork sample graph
-# Syntax:
-#   subject->predicate->object   edge with label
-#   a->b                          unlabeled edge
-#   a->b->c->d                    chain (consecutive pairs become edges)
+# Syntax: every token is a node, consecutive tokens become an edge.
+#   a->b              edge from a to b
+#   a->p->b           three nodes: a -> p -> b (p is its own node)
+#   a->b->c->d        chain of edges a -> b -> c -> d
+# Repeating a token reuses the same node, so `color` below becomes a hub.
 # Lines starting with # or // are comments. Blank lines are ignored.
 
 bird->color->red

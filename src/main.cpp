@@ -33,9 +33,8 @@ struct Node {
 };
 
 struct Edge {
-    int a;             // index into nodes
+    int a; // index into nodes
     int b;
-    std::string label; // empty if no predicate
 };
 
 struct Graph {
@@ -98,21 +97,13 @@ static bool parseGraph(const std::string& text, Graph& g, std::string& err) {
                 return false;
             }
         }
-        if (parts.size() == 2) {
-            int a = g.getOrCreate(parts[0]);
-            int b = g.getOrCreate(parts[1]);
-            g.edges.push_back({a, b, ""});
-        } else if (parts.size() == 3) {
-            int a = g.getOrCreate(parts[0]);
-            int b = g.getOrCreate(parts[2]);
-            g.edges.push_back({a, b, parts[1]});
-        } else {
-            // chain a->b->c->d : treat consecutive pairs as edges (no labels)
-            for (size_t i = 0; i + 1 < parts.size(); ++i) {
-                int a = g.getOrCreate(parts[i]);
-                int b = g.getOrCreate(parts[i + 1]);
-                g.edges.push_back({a, b, ""});
-            }
+        // Every token is a node; consecutive tokens become an edge. This
+        // means `a->p->b` produces three nodes (a, p, b) connected as
+        // a -> p -> b, so relationships are first-class nodes in the graph.
+        for (size_t i = 0; i + 1 < parts.size(); ++i) {
+            int a = g.getOrCreate(parts[i]);
+            int b = g.getOrCreate(parts[i + 1]);
+            g.edges.push_back({a, b});
         }
     }
     return true;
@@ -499,16 +490,6 @@ int main(int argc, char** argv) {
             worldToScreen(g.nodes[e.a].x, g.nodes[e.a].y, ax, ay);
             worldToScreen(g.nodes[e.b].x, g.nodes[e.b].y, bx, by);
             drawThickLine(ren, ax, ay, bx, by, 2);
-        }
-        // edge labels
-        for (auto& e : g.edges) {
-            if (e.label.empty()) continue;
-            float ax, ay, bx, by;
-            worldToScreen(g.nodes[e.a].x, g.nodes[e.a].y, ax, ay);
-            worldToScreen(g.nodes[e.b].x, g.nodes[e.b].y, bx, by);
-            int mx = (int)((ax + bx) * 0.5f);
-            int my = (int)((ay + by) * 0.5f);
-            if (fontEdge) drawText(ren, edgeText, e.label, mx, my, colEdgeLbl);
         }
 
         // nodes
