@@ -1,0 +1,27 @@
+# NodeNetwork sample graph
+# Syntax:
+#   subject->predicate->object   edge with label
+#   a->b                          unlabeled edge
+#   a->b->c->d                    chain (consecutive pairs become edges)
+# Lines starting with # or // are comments. Blank lines are ignored.
+
+bird->color->red
+bird->color->black
+bird->name->crow
+bird->name->sparrow
+bird->habitat->forest
+bird->habitat->city
+
+crow->eats->seeds
+sparrow->eats->seeds
+sparrow->eats->insects
+
+forest->contains->trees
+trees->produce->seeds
+city->contains->buildings
+buildings->host->sparrow
+
+mammal->name->cat
+mammal->name->dog
+cat->eats->sparrow
+dog->lives_in->city

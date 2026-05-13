@@ -1,0 +1,15 @@
+build/
+out/
+.vs/
+.vscode/
+.idea/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.dll
+*.swp
