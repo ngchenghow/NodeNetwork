@@ -1,28 +1,12 @@
-# NodeNetwork sample graph
-# Syntax: every token is a node, consecutive tokens become an edge.
-#   a->b              edge from a to b
-#   a->p->b           three nodes: a -> p -> b (p is its own node)
-#   a->b->c->d        chain of edges a -> b -> c -> d
-# Repeating a token reuses the same node, so `color` below becomes a hub.
-# Lines starting with # or // are comments. Blank lines are ignored.
+//path:fly->animal,show:shortest,search:edge
+//path:brown->bird,show:shortest,search:edge,shortest:one
+//highlight:crow
+//path:john->animal,show:shortest,search:edge
 
-bird->color->red
-bird->color->black
-bird->name->crow
-bird->name->sparrow
-bird->habitat->forest
-bird->habitat->city
-
-crow->eats->seeds
-sparrow->eats->seeds
-sparrow->eats->insects
-
-forest->contains->trees
-trees->produce->seeds
-city->contains->buildings
-buildings->host->sparrow
-
-mammal->name->cat
-mammal->name->dog
-cat->eats->sparrow
-dog->lives_in->city
+hover:john
+man->will->talk
+bird->will->fly
+john->isa->man
+man->isa->animal
+bird->isa->animal
+animal->will->die

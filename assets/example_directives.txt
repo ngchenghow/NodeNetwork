@@ -1,0 +1,12 @@
+path:fly->animal,show:shortest,search:edge
+path:brown->bird,show:shortest,search:edge,shortest:one
+highlight:crow
+path:john->animal,show:shortest,search:edge
+hover:john
+
+man->will->talk
+bird->will->fly
+john->isa->man
+man->isa->animal
+bird->isa->animal
+animal->will->die

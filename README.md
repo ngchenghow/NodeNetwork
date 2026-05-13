@@ -29,15 +29,64 @@ bird->name->crow
 crow->eats->seeds
 ```
 
-In the example above `color`, `name`, and `eats` each become their own
-node, which lets relationship nodes attract their participants and act
-as visible hubs in the layout.
+Here `color`, `name`, and `eats` each become their own node, which lets
+relationship nodes attract their participants and act as visible hubs
+in the layout.
+
+## Highlight directives
+
+A graph file may contain directives that **light up part of the graph
+by default**. Anything not lit is dimmed. Each directive is one line,
+mixed in with the chain lines. Mouse hover always wins over the
+directive-driven default.
+
+| directive | effect |
+| --- | --- |
+| `highlight:a[,b,...]` | light each listed node + every chain (source line) it appears in |
+| `hover:a[,b,...]` | chain-head BFS from each listed node, lighting every chain reachable by following arrows out of head nodes |
+| `path:from->to` | light the shortest path between two nodes |
+| `path:from->to,show:shortest` | same — union every tied-for-shortest path (default) |
+| `path:from->to,shortest:one` | pick a single shortest path |
+| `path:from->to,show:all` | union every simple (no repeated node) path, capped at 500 |
+| `path:from->to,search:node` | path search treats any shared node as a link (default) |
+| `path:from->to,search:edge` | only link chains at their head/tail nodes; from/to must themselves be head/tail of some chain |
+| `path:from->to,includes:x[,includes:y,...]` | constrain the path to pass through each listed intermediate, in order |
+| `join:union` / `join:intersect` | combine multiple directives by union (default) or intersection |
+
+Example ([assets/example_directives.txt](assets/example_directives.txt)):
+
+```
+path:fly->animal,show:shortest,search:edge
+highlight:crow
+hover:john
+
+man->will->talk
+bird->will->fly
+john->isa->man
+man->isa->animal
+bird->isa->animal
+animal->will->die
+```
+
+Run it with:
+
+```
+./build/NodeNetwork assets/example_directives.txt
+```
+
+`hover:john` lights `john`, then transitively `isa`, `man`, `animal`,
+`will`, `talk`, `die`, plus the corresponding edges. `highlight:crow`
+adds nothing here because `crow` isn't in the graph. `path:fly->animal`
+in `search:edge` mode lights the shortest chain-link path from `fly`
+back through `bird` and out to `animal`. All three directive sets are
+unioned (default `join:union`).
 
 ## Controls
 
 | input | action |
 | --- | --- |
 | left-drag a node | pin and move it (release to unpin) |
+| mouse hover a node | transient highlight: chain-head BFS from that node (overrides directive default) |
 | middle-drag / right-drag | pan |
 | mouse wheel | zoom |
 | `R` | reheat — randomize positions |

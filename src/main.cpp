@@ -1,9 +1,11 @@
 // NodeNetwork - SDL2 force-directed graph viewer.
-// Inspired by Obsidian-Node-Network: parse simple `a->predicate->b` lines
-// and render an interactive force-directed graph.
+// Inspired by Obsidian-Node-Network: parse `a->b->c` lines + directives
+// (highlight, hover, path, join) and render an interactive graph where
+// directive targets are lit and the rest is dimmed.
 //
 // Controls:
 //   Left-drag a node    pin and move it (release to unpin)
+//   Mouse hover         transient highlight: chain-head BFS from the hovered node
 //   R                   reheat / randomize positions
 //   Space               pause / resume simulation
 //   Scroll              zoom
@@ -18,12 +20,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
-#include <optional>
+#include <functional>
+#include <queue>
 #include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+// ---------- graph model ----------
 
 struct Node {
     std::string id;
@@ -37,10 +43,43 @@ struct Edge {
     int b;
 };
 
+// A Chain is one source line, e.g. `bird->will->fly` becomes
+// nodeIds=[bird,will,fly], edgeIndices=[bird->will, will->fly]. Chains are
+// the unit of "lighting up" — touching any node in a chain lights the whole
+// chain when used as a directive scope.
+struct Chain {
+    std::vector<int> nodeIds;
+    std::vector<int> edgeIndices;
+};
+
+enum class Show { ShortestAll, ShortestOne, AllSimple };
+enum class Search { Node, Edge };
+enum class JoinMode { Union, Intersect };
+
+struct HighlightDir { std::vector<std::string> ids; };
+struct HoverDir     { std::vector<std::string> ids; };
+struct PathDir {
+    std::string from;
+    std::string to;
+    std::vector<std::string> includes;
+    Show show     = Show::ShortestAll;
+    Search search = Search::Node;
+};
+
 struct Graph {
     std::vector<Node> nodes;
     std::vector<Edge> edges;
     std::unordered_map<std::string, int> idIndex;
+    // Directed edge index for dedup: pack (a, b) into 64 bits.
+    std::unordered_map<uint64_t, int> edgeIndexByPair;
+    std::vector<Chain> chains;
+
+    std::vector<HighlightDir> highlights;
+    std::vector<HoverDir>     hovers;
+    std::vector<PathDir>      paths;
+    JoinMode                  joinMode = JoinMode::Union;
+
+    std::vector<std::string>  parseErrors;
 
     int getOrCreate(const std::string& id) {
         auto it = idIndex.find(id);
@@ -52,7 +91,25 @@ struct Graph {
         idIndex[id] = idx;
         return idx;
     }
+
+    int ensureEdge(int a, int b) {
+        uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32)
+                     |  static_cast<uint64_t>(static_cast<uint32_t>(b));
+        auto it = edgeIndexByPair.find(key);
+        if (it != edgeIndexByPair.end()) return it->second;
+        int idx = static_cast<int>(edges.size());
+        edges.push_back({a, b});
+        edgeIndexByPair[key] = idx;
+        return idx;
+    }
+
+    int findId(const std::string& id) const {
+        auto it = idIndex.find(id);
+        return it == idIndex.end() ? -1 : it->second;
+    }
 };
+
+// ---------- parsing helpers ----------
 
 static std::string trim(const std::string& s) {
     size_t a = 0, b = s.size();
@@ -76,7 +133,101 @@ static std::vector<std::string> splitArrow(const std::string& line) {
     return parts;
 }
 
-static bool parseGraph(const std::string& text, Graph& g, std::string& err) {
+static std::vector<std::string> splitComma(const std::string& s) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        size_t c = s.find(',', pos);
+        if (c == std::string::npos) {
+            std::string t = trim(s.substr(pos));
+            if (!t.empty()) out.push_back(t);
+            break;
+        }
+        std::string t = trim(s.substr(pos, c - pos));
+        if (!t.empty()) out.push_back(t);
+        pos = c + 1;
+    }
+    return out;
+}
+
+// Parse a single line, returning true if it consumed the line as a directive.
+// Adds errors to g.parseErrors on malformed directives.
+static bool tryDirective(Graph& g, const std::string& t, int lineNo) {
+    auto colon = t.find(':');
+    if (colon == std::string::npos) return false;
+    std::string head = trim(t.substr(0, colon));
+    std::string rest = trim(t.substr(colon + 1));
+    std::string headLower = head;
+    for (auto& c : headLower) c = (char)std::tolower((unsigned char)c);
+
+    auto pushErr = [&](const std::string& m) {
+        g.parseErrors.push_back("line " + std::to_string(lineNo) + ": " + m);
+    };
+
+    if (headLower == "join") {
+        std::string v = rest;
+        for (auto& c : v) c = (char)std::tolower((unsigned char)c);
+        if (v == "union")          g.joinMode = JoinMode::Union;
+        else if (v == "intersect") g.joinMode = JoinMode::Intersect;
+        else pushErr("join expects 'union' or 'intersect'");
+        return true;
+    }
+    if (headLower == "highlight") {
+        HighlightDir d;
+        d.ids = splitComma(rest);
+        if (!d.ids.empty()) g.highlights.push_back(std::move(d));
+        return true;
+    }
+    if (headLower == "hover") {
+        HoverDir d;
+        d.ids = splitComma(rest);
+        if (!d.ids.empty()) g.hovers.push_back(std::move(d));
+        return true;
+    }
+    if (headLower == "path") {
+        auto segs = splitComma(rest);
+        if (segs.empty()) { pushErr("path: expects <from>-><to>"); return true; }
+        auto ends = splitArrow(segs[0]);
+        if (ends.size() != 2 || ends[0].empty() || ends[1].empty()) {
+            pushErr("path: expects <from>-><to>");
+            return true;
+        }
+        PathDir p;
+        p.from = ends[0];
+        p.to   = ends[1];
+        for (size_t i = 1; i < segs.size(); ++i) {
+            auto kc = segs[i].find(':');
+            if (kc == std::string::npos) { pushErr("path: bad modifier \"" + segs[i] + "\""); continue; }
+            std::string k = trim(segs[i].substr(0, kc));
+            std::string v = trim(segs[i].substr(kc + 1));
+            std::string kl = k, vl = v;
+            for (auto& c : kl) c = (char)std::tolower((unsigned char)c);
+            for (auto& c : vl) c = (char)std::tolower((unsigned char)c);
+            if (kl == "includes") {
+                if (!v.empty()) p.includes.push_back(v);
+            } else if (kl == "show") {
+                if (vl == "all")           p.show = Show::AllSimple;
+                else if (vl == "shortest") p.show = Show::ShortestAll;
+                else pushErr("show: expects 'all' or 'shortest'");
+            } else if (kl == "search") {
+                if (vl == "node")      p.search = Search::Node;
+                else if (vl == "edge") p.search = Search::Edge;
+                else pushErr("search: expects 'node' or 'edge'");
+            } else if (kl == "shortest") {
+                if (vl == "all")      p.show = Show::ShortestAll;
+                else if (vl == "one") p.show = Show::ShortestOne;
+                else pushErr("shortest: expects 'all' or 'one'");
+            } else {
+                pushErr("path: unknown modifier \"" + segs[i] + "\"");
+            }
+        }
+        g.paths.push_back(std::move(p));
+        return true;
+    }
+    return false;
+}
+
+static bool parseGraph(const std::string& text, Graph& g) {
     std::istringstream is(text);
     std::string line;
     int lineNo = 0;
@@ -85,45 +236,445 @@ static bool parseGraph(const std::string& text, Graph& g, std::string& err) {
         std::string t = trim(line);
         if (t.empty()) continue;
         if (t[0] == '#' || (t.size() >= 2 && t[0] == '/' && t[1] == '/')) continue;
+        if (tryDirective(g, t, lineNo)) continue;
 
         auto parts = splitArrow(t);
         if (parts.size() < 2) {
-            err = "line " + std::to_string(lineNo) + ": expected `a->b` or `a->p->b`";
-            return false;
+            g.parseErrors.push_back("line " + std::to_string(lineNo) + ": expected `a->b` or `a->b->c->...`");
+            continue;
         }
-        for (auto& p : parts) {
-            if (p.empty()) {
-                err = "line " + std::to_string(lineNo) + ": empty token";
-                return false;
+        bool bad = false;
+        for (auto& p : parts) if (p.empty()) { bad = true; break; }
+        if (bad) {
+            g.parseErrors.push_back("line " + std::to_string(lineNo) + ": empty token");
+            continue;
+        }
+        Chain c;
+        for (auto& p : parts) c.nodeIds.push_back(g.getOrCreate(p));
+        for (size_t i = 0; i + 1 < c.nodeIds.size(); ++i) {
+            int ei = g.ensureEdge(c.nodeIds[i], c.nodeIds[i + 1]);
+            c.edgeIndices.push_back(ei);
+        }
+        g.chains.push_back(std::move(c));
+    }
+    return g.parseErrors.empty();
+}
+
+static const char* kDefaultGraph =
+    "# Edit assets/graph.txt to change this graph, or pass a path on the CLI\n"
+    "hover:john\n"
+    "man->will->talk\n"
+    "bird->will->fly\n"
+    "john->isa->man\n"
+    "man->isa->animal\n"
+    "bird->isa->animal\n"
+    "animal->will->die\n";
+
+// ---------- indices over the parsed graph ----------
+
+struct GraphIndex {
+    std::unordered_map<int, std::vector<int>> chainsByNode; // node -> chain indices
+    std::unordered_map<int, std::vector<int>> chainsByHead; // node -> chains where it is the head
+    std::vector<std::vector<int>> adjUndirected;            // node -> neighbor node indices
+
+    void build(const Graph& g) {
+        chainsByNode.clear();
+        chainsByHead.clear();
+        for (size_t ci = 0; ci < g.chains.size(); ++ci) {
+            const auto& c = g.chains[ci];
+            for (int nid : c.nodeIds) chainsByNode[nid].push_back((int)ci);
+            if (!c.nodeIds.empty()) chainsByHead[c.nodeIds.front()].push_back((int)ci);
+        }
+        adjUndirected.assign(g.nodes.size(), {});
+        for (auto& e : g.edges) {
+            adjUndirected[e.a].push_back(e.b);
+            adjUndirected[e.b].push_back(e.a);
+        }
+    }
+};
+
+// ---------- path algorithms (operate on a generic int-id adjacency list) ----------
+
+static constexpr int kMaxPaths = 500;
+
+static std::vector<int> bfsShortestPath(int from, int to,
+                                        const std::vector<std::vector<int>>& adj) {
+    if (from == to) return {from};
+    int n = (int)adj.size();
+    if (from < 0 || to < 0 || from >= n || to >= n) return {};
+    std::vector<int> prev(n, -2);
+    prev[from] = -1;
+    std::queue<int> q;
+    q.push(from);
+    while (!q.empty()) {
+        int cur = q.front(); q.pop();
+        if (cur == to) break;
+        for (int nxt : adj[cur]) {
+            if (prev[nxt] != -2) continue;
+            prev[nxt] = cur;
+            q.push(nxt);
+        }
+    }
+    if (prev[to] == -2) return {};
+    std::vector<int> out;
+    for (int c = to; c != -1; c = prev[c]) out.push_back(c);
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+static std::vector<std::vector<int>> bfsAllShortestPaths(int from, int to,
+                                                        const std::vector<std::vector<int>>& adj) {
+    if (from == to) return {{from}};
+    int n = (int)adj.size();
+    if (from < 0 || to < 0 || from >= n || to >= n) return {};
+    std::vector<int> dist(n, -1);
+    std::vector<std::vector<int>> preds(n);
+    dist[from] = 0;
+    std::vector<int> frontier{from};
+    while (!frontier.empty() && dist[to] == -1) {
+        std::vector<int> next;
+        std::vector<char> inNext(n, 0);
+        for (int cur : frontier) {
+            int d = dist[cur];
+            for (int nxt : adj[cur]) {
+                if (dist[nxt] == -1) {
+                    dist[nxt] = d + 1;
+                    preds[nxt].push_back(cur);
+                    if (!inNext[nxt]) { inNext[nxt] = 1; next.push_back(nxt); }
+                } else if (dist[nxt] == d + 1) {
+                    preds[nxt].push_back(cur);
+                }
             }
         }
-        // Every token is a node; consecutive tokens become an edge. This
-        // means `a->p->b` produces three nodes (a, p, b) connected as
-        // a -> p -> b, so relationships are first-class nodes in the graph.
-        for (size_t i = 0; i + 1 < parts.size(); ++i) {
-            int a = g.getOrCreate(parts[i]);
-            int b = g.getOrCreate(parts[i + 1]);
-            g.edges.push_back({a, b});
+        frontier = std::move(next);
+    }
+    if (dist[to] == -1) return {};
+    std::vector<std::vector<int>> results;
+    std::function<void(int, std::vector<int>&)> build = [&](int node, std::vector<int>& tail) {
+        if ((int)results.size() >= kMaxPaths) return;
+        std::vector<int> path; path.reserve(tail.size() + 1);
+        path.push_back(node);
+        for (int x : tail) path.push_back(x);
+        if (node == from) { results.push_back(std::move(path)); return; }
+        for (int p : preds[node]) {
+            build(p, path);
+            if ((int)results.size() >= kMaxPaths) break;
+        }
+    };
+    std::vector<int> empty;
+    build(to, empty);
+    return results;
+}
+
+static std::vector<std::vector<int>> dfsAllSimplePaths(int from, int to,
+                                                      const std::vector<std::vector<int>>& adj) {
+    int n = (int)adj.size();
+    std::vector<std::vector<int>> results;
+    if (from < 0 || to < 0 || from >= n || to >= n) return results;
+    std::vector<int> stack;
+    std::vector<char> visited(n, 0);
+    std::function<void(int)> dfs = [&](int cur) {
+        if ((int)results.size() >= kMaxPaths) return;
+        visited[cur] = 1; stack.push_back(cur);
+        if (cur == to) {
+            results.push_back(stack);
+        } else {
+            for (int nxt : adj[cur]) {
+                if (visited[nxt]) continue;
+                dfs(nxt);
+                if ((int)results.size() >= kMaxPaths) break;
+            }
+        }
+        stack.pop_back();
+        visited[cur] = 0;
+    };
+    dfs(from);
+    return results;
+}
+
+// Virtual graph for `search:edge`: each chain's middle nodes get their own
+// per-chain virtual vertex, so two chains can only meet at head/tail.
+// Head/tail virtual vertices keep the original node index.
+struct VirtualGraph {
+    std::vector<std::vector<int>> adj;
+    std::vector<int> origNodeOf;                // virt index -> original node index (-1 if synthetic)
+    // (virtA, virtB) -> original edge index
+    std::unordered_map<uint64_t, int> edgeOfPair;
+    int virtN = 0;
+};
+
+static uint64_t packPair(int a, int b) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(a)) << 32)
+         |  static_cast<uint64_t>(static_cast<uint32_t>(b));
+}
+
+static VirtualGraph buildVirtualGraph(const Graph& g) {
+    VirtualGraph v;
+    int n = (int)g.nodes.size();
+    v.origNodeOf.assign(n, -1);
+    for (int i = 0; i < n; ++i) v.origNodeOf[i] = i;
+    v.virtN = n;
+    auto addEdge = [&](int va, int vb, int origEdge) {
+        if (va >= (int)v.adj.size()) v.adj.resize(va + 1);
+        if (vb >= (int)v.adj.size()) v.adj.resize(vb + 1);
+        v.adj[va].push_back(vb);
+        v.adj[vb].push_back(va);
+        v.edgeOfPair[packPair(va, vb)] = origEdge;
+        v.edgeOfPair[packPair(vb, va)] = origEdge;
+    };
+    v.adj.resize(n);
+    for (size_t ci = 0; ci < g.chains.size(); ++ci) {
+        const auto& c = g.chains[ci];
+        int len = (int)c.nodeIds.size();
+        if (len < 2) continue;
+        std::vector<int> vIds(len);
+        for (int j = 0; j < len; ++j) {
+            if (j == 0 || j == len - 1) {
+                vIds[j] = c.nodeIds[j];
+            } else {
+                int newIdx = (int)v.origNodeOf.size();
+                v.origNodeOf.push_back(c.nodeIds[j]);
+                v.adj.emplace_back();
+                vIds[j] = newIdx;
+            }
+        }
+        for (int j = 0; j + 1 < len; ++j) addEdge(vIds[j], vIds[j + 1], c.edgeIndices[j]);
+    }
+    v.virtN = (int)v.origNodeOf.size();
+    return v;
+}
+
+// ---------- lit set computation ----------
+
+struct LitSet {
+    std::unordered_set<int> nodes;
+    std::unordered_set<int> edges;
+    bool empty() const { return nodes.empty() && edges.empty(); }
+};
+
+static void addChainToLit(const Graph& g, int ci, LitSet& out) {
+    const auto& c = g.chains[ci];
+    for (int nid : c.nodeIds)    out.nodes.insert(nid);
+    for (int eid : c.edgeIndices) out.edges.insert(eid);
+}
+
+static LitSet litFromHighlight(const Graph& g, const GraphIndex& gi,
+                               const std::vector<std::string>& ids) {
+    LitSet out;
+    for (auto& id : ids) {
+        int nid = g.findId(id);
+        if (nid < 0) continue;
+        out.nodes.insert(nid);
+        auto it = gi.chainsByNode.find(nid);
+        if (it != gi.chainsByNode.end())
+            for (int ci : it->second) addChainToLit(g, ci, out);
+    }
+    return out;
+}
+
+static LitSet litFromHover(const Graph& g, const GraphIndex& gi,
+                           const std::vector<std::string>& ids) {
+    LitSet out;
+    for (auto& id : ids) {
+        int start = g.findId(id);
+        if (start < 0) continue;
+        out.nodes.insert(start);
+        std::unordered_set<int> visitedChains;
+        std::unordered_set<int> visitedNodes;
+        std::queue<int> q;
+        auto addNode = [&](int n) {
+            if (visitedNodes.insert(n).second) q.push(n);
+        };
+        auto addChain = [&](int ci) {
+            if (!visitedChains.insert(ci).second) return;
+            for (int n : g.chains[ci].nodeIds) addNode(n);
+        };
+        addNode(start);
+        auto seedIt = gi.chainsByNode.find(start);
+        if (seedIt != gi.chainsByNode.end())
+            for (int ci : seedIt->second) addChain(ci);
+        while (!q.empty()) {
+            int cur = q.front(); q.pop();
+            auto hit = gi.chainsByHead.find(cur);
+            if (hit != gi.chainsByHead.end())
+                for (int ci : hit->second) addChain(ci);
+        }
+        for (int ci : visitedChains) addChainToLit(g, ci, out);
+    }
+    return out;
+}
+
+// Light up a sequence in the original graph (used for search:node paths).
+static void addSequenceToLit(const Graph& g, const std::vector<int>& seq, LitSet& out) {
+    for (int n : seq) out.nodes.insert(n);
+    for (size_t i = 0; i + 1 < seq.size(); ++i) {
+        uint64_t key = packPair(seq[i], seq[i + 1]);
+        auto it = g.edgeIndexByPair.find(key);
+        if (it != g.edgeIndexByPair.end()) {
+            out.edges.insert(it->second);
+            continue;
+        }
+        // Reverse direction (paths are undirected).
+        key = packPair(seq[i + 1], seq[i]);
+        it = g.edgeIndexByPair.find(key);
+        if (it != g.edgeIndexByPair.end()) out.edges.insert(it->second);
+    }
+}
+
+// Light a virtual-graph sequence (search:edge mode). Each virt id maps to an
+// original node; edges map via the virtual graph's edge-of-pair table.
+static void addVirtualSequenceToLit(const VirtualGraph& v, const std::vector<int>& vSeq, LitSet& out) {
+    for (int vid : vSeq) {
+        if (vid >= 0 && vid < (int)v.origNodeOf.size())
+            out.nodes.insert(v.origNodeOf[vid]);
+    }
+    for (size_t i = 0; i + 1 < vSeq.size(); ++i) {
+        auto it = v.edgeOfPair.find(packPair(vSeq[i], vSeq[i + 1]));
+        if (it != v.edgeOfPair.end()) out.edges.insert(it->second);
+    }
+}
+
+static bool litFromPath(const Graph& g, const GraphIndex& gi, const VirtualGraph* virtMaybe,
+                       const PathDir& p, LitSet& out) {
+    int from = g.findId(p.from);
+    int to   = g.findId(p.to);
+    if (from < 0 || to < 0) return false;
+    for (auto& w : p.includes) if (g.findId(w) < 0) return false;
+
+    if (p.search == Search::Edge) {
+        // Need a virtual graph; from/to must be head/tail of some chain.
+        if (!virtMaybe) return false;
+        const VirtualGraph& v = *virtMaybe;
+        // In the virtual graph, head/tail vertices have origNodeOf == themselves.
+        // Validate from/to are original head/tail by checking that vertex `from`
+        // has origNodeOf[from] == from and that it actually has neighbors.
+        if (from >= v.virtN || to >= v.virtN) return false;
+
+        if (p.show == Show::AllSimple) {
+            auto all = dfsAllSimplePaths(from, to, v.adj);
+            if (all.empty()) return false;
+            std::unordered_set<int> required;
+            for (auto& w : p.includes) required.insert(g.findId(w));
+            bool any = false;
+            for (auto& seq : all) {
+                if (!required.empty()) {
+                    std::unordered_set<int> origs;
+                    for (int vid : seq) if (vid < (int)v.origNodeOf.size()) origs.insert(v.origNodeOf[vid]);
+                    bool ok = true;
+                    for (int r : required) if (!origs.count(r)) { ok = false; break; }
+                    if (!ok) continue;
+                }
+                addVirtualSequenceToLit(v, seq, out);
+                any = true;
+            }
+            return any;
+        }
+
+        std::vector<int> waypoints;
+        waypoints.push_back(from);
+        for (auto& w : p.includes) waypoints.push_back(g.findId(w));
+        waypoints.push_back(to);
+        for (size_t i = 0; i + 1 < waypoints.size(); ++i) {
+            if (p.show == Show::ShortestOne) {
+                auto seg = bfsShortestPath(waypoints[i], waypoints[i + 1], v.adj);
+                if (seg.empty()) return false;
+                addVirtualSequenceToLit(v, seg, out);
+            } else {
+                auto segs = bfsAllShortestPaths(waypoints[i], waypoints[i + 1], v.adj);
+                if (segs.empty()) return false;
+                for (auto& s : segs) addVirtualSequenceToLit(v, s, out);
+            }
+        }
+        return true;
+    }
+
+    // search:node — operate directly on the original undirected adjacency.
+    if (p.show == Show::AllSimple) {
+        auto all = dfsAllSimplePaths(from, to, gi.adjUndirected);
+        if (all.empty()) return false;
+        std::unordered_set<int> required;
+        for (auto& w : p.includes) required.insert(g.findId(w));
+        bool any = false;
+        for (auto& seq : all) {
+            if (!required.empty()) {
+                std::unordered_set<int> in(seq.begin(), seq.end());
+                bool ok = true;
+                for (int r : required) if (!in.count(r)) { ok = false; break; }
+                if (!ok) continue;
+            }
+            addSequenceToLit(g, seq, out);
+            any = true;
+        }
+        return any;
+    }
+    std::vector<int> waypoints;
+    waypoints.push_back(from);
+    for (auto& w : p.includes) waypoints.push_back(g.findId(w));
+    waypoints.push_back(to);
+    for (size_t i = 0; i + 1 < waypoints.size(); ++i) {
+        if (p.show == Show::ShortestOne) {
+            auto seg = bfsShortestPath(waypoints[i], waypoints[i + 1], gi.adjUndirected);
+            if (seg.empty()) return false;
+            addSequenceToLit(g, seg, out);
+        } else {
+            auto segs = bfsAllShortestPaths(waypoints[i], waypoints[i + 1], gi.adjUndirected);
+            if (segs.empty()) return false;
+            for (auto& s : segs) addSequenceToLit(g, s, out);
         }
     }
     return true;
 }
 
-static const char* kDefaultGraph =
-    "# Edit assets/graph.txt to change this graph, or pass a path on the CLI\n"
-    "bird->color->red\n"
-    "bird->color->black\n"
-    "bird->name->crow\n"
-    "bird->name->sparrow\n"
-    "bird->habitat->forest\n"
-    "bird->habitat->city\n"
-    "crow->eats->seeds\n"
-    "sparrow->eats->seeds\n"
-    "sparrow->eats->insects\n"
-    "forest->contains->trees\n"
-    "trees->produce->seeds\n";
+// Combine directive lit-sets via the join mode, returning the final default
+// lit-set or std::nullopt if no directives produced anything.
+struct DefaultLit {
+    LitSet set;
+    bool active = false;
+};
 
-// ---------- rendering ----------
+static DefaultLit computeDefaultLit(const Graph& g, const GraphIndex& gi) {
+    std::vector<LitSet> sets;
+    for (auto& h : g.highlights) {
+        auto s = litFromHighlight(g, gi, h.ids);
+        if (!s.empty()) sets.push_back(std::move(s));
+    }
+    for (auto& h : g.hovers) {
+        auto s = litFromHover(g, gi, h.ids);
+        if (!s.empty()) sets.push_back(std::move(s));
+    }
+    if (!g.paths.empty()) {
+        // Build the virtual graph lazily; cheap enough to always build when paths exist.
+        VirtualGraph v = buildVirtualGraph(g);
+        for (auto& p : g.paths) {
+            LitSet s;
+            if (litFromPath(g, gi, &v, p, s) && !s.empty()) sets.push_back(std::move(s));
+        }
+    }
+    DefaultLit dl;
+    if (sets.empty()) return dl;
+    if (sets.size() == 1) { dl.set = std::move(sets[0]); dl.active = true; return dl; }
+    if (g.joinMode == JoinMode::Intersect) {
+        LitSet acc = sets[0];
+        for (size_t i = 1; i < sets.size(); ++i) {
+            LitSet nx;
+            for (int n : acc.nodes) if (sets[i].nodes.count(n)) nx.nodes.insert(n);
+            for (int e : acc.edges) if (sets[i].edges.count(e)) nx.edges.insert(e);
+            acc = std::move(nx);
+        }
+        dl.set = std::move(acc);
+    } else {
+        LitSet acc;
+        for (auto& s : sets) {
+            for (int n : s.nodes) acc.nodes.insert(n);
+            for (int e : s.edges) acc.edges.insert(e);
+        }
+        dl.set = std::move(acc);
+    }
+    dl.active = true;
+    return dl;
+}
+
+// ---------- rendering primitives ----------
 
 static void fillCircle(SDL_Renderer* r, int cx, int cy, int radius) {
     for (int dy = -radius; dy <= radius; ++dy) {
@@ -148,7 +699,6 @@ static void strokeCircle(SDL_Renderer* r, int cx, int cy, int radius) {
     }
 }
 
-// Thicken a line by drawing parallel offsets. Cheap, looks OK at small widths.
 static void drawThickLine(SDL_Renderer* r, float x1, float y1, float x2, float y2, int thickness) {
     float dx = x2 - x1, dy = y2 - y1;
     float len = std::sqrt(dx * dx + dy * dy);
@@ -161,7 +711,6 @@ static void drawThickLine(SDL_Renderer* r, float x1, float y1, float x2, float y
     }
 }
 
-// Filled triangle via SDL_RenderGeometry (SDL 2.0.18+).
 static void fillTriangle(SDL_Renderer* r, float ax, float ay, float bx, float by,
                          float cx, float cy, SDL_Color color) {
     SDL_Vertex v[3];
@@ -171,26 +720,20 @@ static void fillTriangle(SDL_Renderer* r, float ax, float ay, float bx, float by
     SDL_RenderGeometry(r, nullptr, v, 3, nullptr, 0);
 }
 
-// Draw an arrow from (x1,y1) toward (x2,y2). The tip sits `tipInset`
-// pixels short of (x2,y2) so it lands on the target node's border
-// instead of vanishing inside the disc.
 static void drawArrow(SDL_Renderer* r, float x1, float y1, float x2, float y2,
                       float tipInset, int shaftThickness, float headLen,
                       float headHalfWidth, SDL_Color color) {
     float dx = x2 - x1, dy = y2 - y1;
     float len = std::sqrt(dx * dx + dy * dy);
     if (len < tipInset + 1.f) return;
-    float ux = dx / len, uy = dy / len;          // unit direction
-    float px = -uy,      py = ux;                // perpendicular
+    float ux = dx / len, uy = dy / len;
+    float px = -uy,      py = ux;
     float tipX = x2 - ux * tipInset;
     float tipY = y2 - uy * tipInset;
     float baseX = tipX - ux * headLen;
     float baseY = tipY - uy * headLen;
-
-    // shaft stops at the arrowhead base so the head paints cleanly on top.
     SDL_SetRenderDrawColor(r, color.r, color.g, color.b, color.a);
     drawThickLine(r, x1, y1, baseX, baseY, shaftThickness);
-
     fillTriangle(r,
         tipX, tipY,
         baseX + px * headHalfWidth, baseY + py * headHalfWidth,
@@ -204,14 +747,12 @@ struct TextCache {
     struct Entry { SDL_Texture* tex; int w, h; };
     std::unordered_map<std::string, Entry> map;
 
-    ~TextCache() {
-        for (auto& kv : map) SDL_DestroyTexture(kv.second.tex);
-    }
+    ~TextCache() { for (auto& kv : map) SDL_DestroyTexture(kv.second.tex); }
 
     Entry get(const std::string& s, SDL_Color color) {
-        // Cache key folds color in so we can reuse for dim labels too.
         char key[256];
-        std::snprintf(key, sizeof(key), "%02x%02x%02x|%s", color.r, color.g, color.b, s.c_str());
+        std::snprintf(key, sizeof(key), "%02x%02x%02x%02x|%s",
+                      color.r, color.g, color.b, color.a, s.c_str());
         auto it = map.find(key);
         if (it != map.end()) return it->second;
         SDL_Surface* surf = TTF_RenderUTF8_Blended(font, s.c_str(), color);
@@ -224,7 +765,8 @@ struct TextCache {
     }
 };
 
-static void drawText(SDL_Renderer* r, TextCache& cache, const std::string& s, int x, int y, SDL_Color color, bool centerX = true, bool centerY = true) {
+static void drawText(SDL_Renderer* r, TextCache& cache, const std::string& s,
+                     int x, int y, SDL_Color color, bool centerX = true, bool centerY = true) {
     auto e = cache.get(s, color);
     if (!e.tex) return;
     SDL_Rect dst;
@@ -295,12 +837,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "No usable TTF font found. Drop one at assets/font.ttf\n");
     }
 
-    // Load graph: CLI path > assets/graph.txt > built-in default.
     std::string source;
     {
-        std::string path;
-        if (argc >= 2) path = argv[1];
-        else path = "assets/graph.txt";
+        std::string path = (argc >= 2) ? argv[1] : "assets/graph.txt";
         std::ifstream f(path);
         if (f) {
             std::stringstream ss; ss << f.rdbuf();
@@ -313,13 +852,16 @@ int main(int argc, char** argv) {
     }
 
     Graph g;
-    std::string err;
-    if (!parseGraph(source, g, err)) {
-        std::fprintf(stderr, "parse error: %s\n", err.c_str());
-        // fall back to default so the window still shows something
-        g = Graph();
-        parseGraph(kDefaultGraph, g, err);
-    }
+    parseGraph(source, g);
+    for (auto& e : g.parseErrors) std::fprintf(stderr, "parse: %s\n", e.c_str());
+    std::printf("graph: %d nodes, %d edges, %d chains, %d directives (h=%d hv=%d p=%d)\n",
+        (int)g.nodes.size(), (int)g.edges.size(), (int)g.chains.size(),
+        (int)(g.highlights.size() + g.hovers.size() + g.paths.size()),
+        (int)g.highlights.size(), (int)g.hovers.size(), (int)g.paths.size());
+
+    GraphIndex gi;
+    gi.build(g);
+    DefaultLit defaultLit = computeDefaultLit(g, gi);
 
     // initial layout: spread nodes on a circle
     std::mt19937 rng(1234);
@@ -339,13 +881,12 @@ int main(int argc, char** argv) {
     };
     seedLayout();
 
-    // Simulation parameters - tuned for ~50 nodes at 1100x720.
     struct {
-        float repel = 6500.f;       // charge strength
-        float springK = 0.04f;      // spring constant
-        float springLen = 110.f;    // natural edge length
-        float centerK = 0.005f;     // pull to center
-        float damping = 0.85f;      // velocity decay per step
+        float repel = 6500.f;
+        float springK = 0.04f;
+        float springLen = 110.f;
+        float centerK = 0.005f;
+        float damping = 0.85f;
         float maxSpeed = 30.f;
         int nodeRadius = 14;
     } sim;
@@ -384,12 +925,17 @@ int main(int argc, char** argv) {
     TextCache edgeText{ren, fontEdge, {}};
 
     SDL_Color colBg     = {18, 20, 24, 255};
-    SDL_Color colEdge   = {110, 120, 140, 200};
+    SDL_Color colEdge   = {110, 120, 140, 220};
+    SDL_Color colEdgeDim= {70, 78, 92, 90};
+    SDL_Color colEdgeHi = {255, 210, 110, 240};
     SDL_Color colEdgeLbl= {170, 180, 200, 220};
     SDL_Color colNode   = {130, 170, 240, 255};
     SDL_Color colNodeBd = {220, 230, 250, 255};
+    SDL_Color colNodeDim= {70, 80, 100, 120};
+    SDL_Color colNodeHi = {255, 180, 90, 255};
+    SDL_Color colNodeBdHi = {255, 235, 170, 255};
     SDL_Color colNodeLbl= {245, 248, 255, 255};
-    SDL_Color colNodeHi = {255, 200, 110, 255};
+    SDL_Color colNodeLblDim = {150, 158, 175, 200};
 
     bool running = true;
     while (running) {
@@ -463,12 +1009,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---------- physics step ----------
+        // physics step
         if (!paused && !g.nodes.empty()) {
             int n = (int)g.nodes.size();
             std::vector<float> fx(n, 0.f), fy(n, 0.f);
-
-            // Repulsion (O(n^2) - fine up to a few hundred nodes)
             for (int i = 0; i < n; ++i) {
                 for (int j = i + 1; j < n; ++j) {
                     float dx = g.nodes[i].x - g.nodes[j].x;
@@ -480,7 +1024,6 @@ int main(int argc, char** argv) {
                     fx[j] -= f * dx * invD; fy[j] -= f * dy * invD;
                 }
             }
-            // Spring (edges)
             for (auto& e : g.edges) {
                 float dx = g.nodes[e.b].x - g.nodes[e.a].x;
                 float dy = g.nodes[e.b].y - g.nodes[e.a].y;
@@ -489,13 +1032,11 @@ int main(int argc, char** argv) {
                 fx[e.a] += f * dx / d; fy[e.a] += f * dy / d;
                 fx[e.b] -= f * dx / d; fy[e.b] -= f * dy / d;
             }
-            // Centering
             float cx = winW * 0.5f, cy = winH * 0.5f;
             for (int i = 0; i < n; ++i) {
                 fx[i] += (cx - g.nodes[i].x) * sim.centerK;
                 fy[i] += (cy - g.nodes[i].y) * sim.centerK;
             }
-            // Integrate
             for (int i = 0; i < n; ++i) {
                 if (g.nodes[i].pinned) continue;
                 g.nodes[i].vx = (g.nodes[i].vx + fx[i]) * sim.damping;
@@ -510,28 +1051,43 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---------- render ----------
-        SDL_SetRenderDrawColor(ren, colBg.r, colBg.g, colBg.b, colBg.a);
-        SDL_RenderClear(ren);
-
+        // Effective lit set: mouse hover takes precedence over directive default.
         int hovered = -1;
         {
             int mx, my; SDL_GetMouseState(&mx, &my);
             hovered = pickNode(mx, my);
         }
+        const LitSet* activeLit = nullptr;
+        LitSet hoverLit;
+        if (hovered >= 0) {
+            hoverLit = litFromHover(g, gi, {g.nodes[hovered].id});
+            activeLit = &hoverLit;
+        } else if (defaultLit.active) {
+            activeLit = &defaultLit.set;
+        }
+        auto nodeLit = [&](int i) { return !activeLit || activeLit->nodes.count(i); };
+        auto edgeLit = [&](int i) { return !activeLit || activeLit->edges.count(i); };
 
-        // edges (drawn as arrows that stop at the target node's border)
+        // render
+        SDL_SetRenderDrawColor(ren, colBg.r, colBg.g, colBg.b, colBg.a);
+        SDL_RenderClear(ren);
+
+        // edges
         {
             float inset      = sim.nodeRadius * zoom + 1.f;
             float headLen    = std::max(8.f, 9.f * zoom);
             float headHalfW  = std::max(4.f, 5.f * zoom);
             int   shaftThick = std::max(1, (int)std::round(2.f * std::min(zoom, 1.5f)));
-            for (auto& e : g.edges) {
+            int   shaftThickHi = shaftThick + 2;
+            for (int ei = 0; ei < (int)g.edges.size(); ++ei) {
+                const auto& e = g.edges[ei];
                 float ax, ay, bx, by;
                 worldToScreen(g.nodes[e.a].x, g.nodes[e.a].y, ax, ay);
                 worldToScreen(g.nodes[e.b].x, g.nodes[e.b].y, bx, by);
-                drawArrow(ren, ax, ay, bx, by,
-                          inset, shaftThick, headLen, headHalfW, colEdge);
+                bool lit = edgeLit(ei);
+                SDL_Color c = lit ? (activeLit ? colEdgeHi : colEdge) : colEdgeDim;
+                int th = lit && activeLit ? shaftThickHi : shaftThick;
+                drawArrow(ren, ax, ay, bx, by, inset, th, headLen, headHalfW, c);
             }
         }
 
@@ -541,21 +1097,48 @@ int main(int argc, char** argv) {
             worldToScreen(g.nodes[i].x, g.nodes[i].y, sx, sy);
             int radius = (int)std::round(sim.nodeRadius * zoom);
             if (radius < 4) radius = 4;
-            bool hi = (i == hovered || i == draggingNode);
-            SDL_Color fill = hi ? colNodeHi : colNode;
+            bool isDrag = (i == draggingNode);
+            bool lit    = nodeLit(i);
+            SDL_Color fill = lit ? (activeLit ? colNodeHi : colNode) : colNodeDim;
+            SDL_Color bd   = lit ? (activeLit ? colNodeBdHi : colNodeBd) : colNodeDim;
+            if (isDrag) fill = colNodeHi;
             SDL_SetRenderDrawColor(ren, fill.r, fill.g, fill.b, fill.a);
             fillCircle(ren, (int)sx, (int)sy, radius);
-            SDL_SetRenderDrawColor(ren, colNodeBd.r, colNodeBd.g, colNodeBd.b, colNodeBd.a);
+            SDL_SetRenderDrawColor(ren, bd.r, bd.g, bd.b, bd.a);
             strokeCircle(ren, (int)sx, (int)sy, radius);
-            if (fontNode) drawText(ren, nodeText, g.nodes[i].id, (int)sx, (int)sy - radius - 12, colNodeLbl);
+            if (fontNode) {
+                SDL_Color lblCol = lit ? colNodeLbl : colNodeLblDim;
+                drawText(ren, nodeText, g.nodes[i].id, (int)sx, (int)sy - radius - 12, lblCol);
+            }
         }
 
         // status line
         if (fontEdge) {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf), "nodes:%d  edges:%d  zoom:%.2f  %s  [R reheat] [Space pause] [scroll zoom] [middle-drag pan]",
-                (int)g.nodes.size(), (int)g.edges.size(), zoom, paused ? "PAUSED" : "running");
+            const char* mode = (hovered >= 0) ? "hover" : (defaultLit.active ? "directive" : "all");
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                "nodes:%d  edges:%d  chains:%d  zoom:%.2f  lit:%s  %s  "
+                "[R reheat] [Space pause] [scroll zoom] [middle-drag pan]",
+                (int)g.nodes.size(), (int)g.edges.size(), (int)g.chains.size(),
+                zoom, mode, paused ? "PAUSED" : "running");
             drawText(ren, edgeText, buf, 10, winH - 18, colEdgeLbl, false, false);
+
+            // Show directive summary at the top
+            if (defaultLit.active || !g.parseErrors.empty()) {
+                char top[320];
+                std::snprintf(top, sizeof(top),
+                    "directives: %d highlight / %d hover / %d path  (join:%s)",
+                    (int)g.highlights.size(), (int)g.hovers.size(), (int)g.paths.size(),
+                    g.joinMode == JoinMode::Intersect ? "intersect" : "union");
+                drawText(ren, edgeText, top, 10, 8, colEdgeLbl, false, false);
+                int y = 26;
+                for (auto& er : g.parseErrors) {
+                    SDL_Color errC{255, 120, 120, 240};
+                    drawText(ren, edgeText, er, 10, y, errC, false, false);
+                    y += 16;
+                    if (y > 100) break;
+                }
+            }
         }
 
         SDL_RenderPresent(ren);
