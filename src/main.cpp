@@ -39,8 +39,29 @@ struct Node {
 };
 
 struct Edge {
-    int a; // index into nodes
+    int a;       // index into nodes
     int b;
+    bool derived = false; // true if added (or marked) by a fired rule
+};
+
+// ---------- rules ----------
+
+// A term in a rule pattern is either a variable (when it starts with an
+// uppercase ASCII letter) or a constant (any other token). Variables are
+// captured by name and unified across all patterns in a rule.
+struct Term {
+    bool isVar = false;
+    std::string name;
+};
+
+struct TriplePattern {
+    Term s, p, o;
+};
+
+struct Rule {
+    std::vector<TriplePattern> antecedent;
+    std::vector<TriplePattern> consequent;
+    int sourceLine = 0;
 };
 
 // A Chain is one source line, e.g. `bird->will->fly` becomes
@@ -78,6 +99,11 @@ struct Graph {
     std::vector<HoverDir>     hovers;
     std::vector<PathDir>      paths;
     JoinMode                  joinMode = JoinMode::Union;
+
+    std::vector<Rule>         rules;
+    // Index in `chains` where rule-derived chains start. Everything before
+    // this came directly from source lines.
+    int                       firstDerivedChain = -1;
 
     std::vector<std::string>  parseErrors;
 
@@ -227,15 +253,138 @@ static bool tryDirective(Graph& g, const std::string& t, int lineNo) {
     return false;
 }
 
+// Case-insensitive equality against a single keyword.
+static bool ieq(const std::string& a, const char* b) {
+    size_t n = 0; while (b[n]) ++n;
+    if (a.size() != n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i]))
+            return false;
+    return true;
+}
+
+// Split `text` on the case-insensitive token `sep` (matched as a whole word).
+static std::vector<std::string> splitWord(const std::string& text, const char* sep) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    size_t sn = 0; while (sep[sn]) ++sn;
+    while (pos <= text.size()) {
+        // find next occurrence of `sep` as a whole word
+        size_t hit = std::string::npos;
+        for (size_t i = pos; i + sn <= text.size(); ++i) {
+            bool ok = true;
+            for (size_t k = 0; k < sn; ++k) {
+                if (std::tolower((unsigned char)text[i + k]) != std::tolower((unsigned char)sep[k])) { ok = false; break; }
+            }
+            if (!ok) continue;
+            // word boundaries: not preceded/followed by an alpha char
+            bool leftOk  = (i == 0)               || !std::isalnum((unsigned char)text[i - 1]);
+            bool rightOk = (i + sn == text.size()) || !std::isalnum((unsigned char)text[i + sn]);
+            if (leftOk && rightOk) { hit = i; break; }
+        }
+        if (hit == std::string::npos) {
+            out.push_back(trim(text.substr(pos)));
+            break;
+        }
+        out.push_back(trim(text.substr(pos, hit - pos)));
+        pos = hit + sn;
+    }
+    return out;
+}
+
+static Term makeTerm(const std::string& tok) {
+    Term t;
+    t.name = tok;
+    // Variable = first character is an ASCII uppercase letter.
+    if (!tok.empty() && tok[0] >= 'A' && tok[0] <= 'Z') t.isVar = true;
+    return t;
+}
+
+// Parse a single `s->p->o` triple pattern. Returns true on success.
+static bool parseTriplePattern(const std::string& src, TriplePattern& out, std::string& err) {
+    auto parts = splitArrow(src);
+    if (parts.size() != 3) { err = "expected `s->p->o`, got `" + src + "`"; return false; }
+    for (auto& p : parts) if (p.empty()) { err = "empty term in `" + src + "`"; return false; }
+    out.s = makeTerm(parts[0]);
+    out.p = makeTerm(parts[1]);
+    out.o = makeTerm(parts[2]);
+    return true;
+}
+
+// Append the triple patterns parsed from one line (possibly containing `AND`)
+// into `dst`. Records errors against `lineNo`.
+static void parsePatternLine(Graph& g, std::vector<TriplePattern>& dst,
+                             const std::string& line, int lineNo) {
+    auto pieces = splitWord(line, "AND");
+    for (auto& piece : pieces) {
+        if (piece.empty()) continue;
+        TriplePattern tp;
+        std::string err;
+        if (parseTriplePattern(piece, tp, err))
+            dst.push_back(tp);
+        else
+            g.parseErrors.push_back("line " + std::to_string(lineNo) + ": " + err);
+    }
+}
+
 static bool parseGraph(const std::string& text, Graph& g) {
     std::istringstream is(text);
     std::string line;
     int lineNo = 0;
+
+    enum class RuleState { None, Antecedent, Consequent };
+    RuleState rs = RuleState::None;
+    Rule current;
+    int currentStartLine = 0;
+
+    auto flushRule = [&]() {
+        if (rs == RuleState::None) return;
+        if (current.antecedent.empty() || current.consequent.empty()) {
+            g.parseErrors.push_back("line " + std::to_string(currentStartLine) +
+                ": rule needs at least one antecedent and one consequent");
+        } else {
+            current.sourceLine = currentStartLine;
+            g.rules.push_back(std::move(current));
+        }
+        current = Rule();
+        rs = RuleState::None;
+    };
+
     while (std::getline(is, line)) {
         ++lineNo;
         std::string t = trim(line);
-        if (t.empty()) continue;
+
+        // A blank line terminates an in-progress rule but is otherwise ignored.
+        if (t.empty()) { flushRule(); continue; }
+
         if (t[0] == '#' || (t.size() >= 2 && t[0] == '/' && t[1] == '/')) continue;
+
+        // Keyword detection (case-insensitive).
+        if (ieq(t, "IF")) {
+            if (rs != RuleState::None) flushRule();
+            rs = RuleState::Antecedent;
+            currentStartLine = lineNo;
+            continue;
+        }
+        if (ieq(t, "THEN")) {
+            if (rs == RuleState::Antecedent) {
+                rs = RuleState::Consequent;
+            } else {
+                g.parseErrors.push_back("line " + std::to_string(lineNo) + ": THEN without IF");
+            }
+            continue;
+        }
+
+        if (rs == RuleState::Antecedent) {
+            parsePatternLine(g, current.antecedent, t, lineNo);
+            continue;
+        }
+        if (rs == RuleState::Consequent) {
+            parsePatternLine(g, current.consequent, t, lineNo);
+            continue;
+        }
+
+        // Outside of any rule: try directives, then chain syntax.
         if (tryDirective(g, t, lineNo)) continue;
 
         auto parts = splitArrow(t);
@@ -257,7 +406,161 @@ static bool parseGraph(const std::string& text, Graph& g) {
         }
         g.chains.push_back(std::move(c));
     }
+    flushRule(); // EOF inside a rule block
     return g.parseErrors.empty();
+}
+
+// ---------- rule evaluation ----------
+
+// Resolve a term to a node id under the current binding. Returns -1 if the
+// term is an unbound variable or names a constant absent from the graph.
+static int resolveTerm(const Graph& g, const std::unordered_map<std::string, int>& binding,
+                       const Term& t) {
+    if (t.isVar) {
+        auto it = binding.find(t.name);
+        return it == binding.end() ? -1 : it->second;
+    }
+    return g.findId(t.name);
+}
+
+// Attempt to unify a term with a concrete node id under the current binding.
+// Returns false if the term is a constant naming a different node, or a
+// variable already bound to a different node. On success, may extend the
+// binding (caller is responsible for snapshot/restore on backtrack).
+static bool unify(const Graph& g, const Term& t, int val,
+                  std::unordered_map<std::string, int>& binding) {
+    if (t.isVar) {
+        auto it = binding.find(t.name);
+        if (it == binding.end()) { binding[t.name] = val; return true; }
+        return it->second == val;
+    }
+    int cId = g.findId(t.name);
+    return cId == val;
+}
+
+// Find every assignment of the rule's variables that satisfies all antecedent
+// triples. Each triple matches the 2-hop pattern s -> p -> o in the directed
+// graph (i.e. there is an edge s->p AND an edge p->o).
+static std::vector<std::unordered_map<std::string, int>>
+matchAntecedent(const Graph& g, const std::vector<TriplePattern>& pats) {
+    int n = (int)g.nodes.size();
+    std::vector<std::vector<int>> out(n);
+    std::vector<std::vector<int>> in(n);
+    for (auto& e : g.edges) { out[e.a].push_back(e.b); in[e.b].push_back(e.a); }
+
+    std::vector<std::unordered_map<std::string, int>> results;
+    std::unordered_map<std::string, int> binding;
+
+    std::function<void(size_t)> rec = [&](size_t idx) {
+        if (idx == pats.size()) { results.push_back(binding); return; }
+        const auto& pat = pats[idx];
+
+        // Choose iteration strategy based on which of s/p/o is already pinned.
+        int pFix = resolveTerm(g, binding, pat.p);
+        int sFix = resolveTerm(g, binding, pat.s);
+        int oFix = resolveTerm(g, binding, pat.o);
+
+        auto tryTriple = [&](int sv, int pv, int ov) {
+            auto saved = binding;
+            if (unify(g, pat.s, sv, binding) &&
+                unify(g, pat.p, pv, binding) &&
+                unify(g, pat.o, ov, binding)) {
+                rec(idx + 1);
+            }
+            binding = saved;
+        };
+
+        if (pFix >= 0) {
+            // Iterate predecessors X of p, then successors Y of p.
+            for (int sv : in[pFix]) {
+                if (sFix >= 0 && sFix != sv) continue;
+                for (int ov : out[pFix]) {
+                    if (oFix >= 0 && oFix != ov) continue;
+                    tryTriple(sv, pFix, ov);
+                }
+            }
+        } else if (sFix >= 0) {
+            for (int pv : out[sFix]) {
+                for (int ov : out[pv]) {
+                    if (oFix >= 0 && oFix != ov) continue;
+                    tryTriple(sFix, pv, ov);
+                }
+            }
+        } else if (oFix >= 0) {
+            for (int pv : in[oFix]) {
+                for (int sv : in[pv]) tryTriple(sv, pv, oFix);
+            }
+        } else {
+            // All three free — iterate every 2-hop triple in the graph.
+            for (int sv = 0; sv < n; ++sv) {
+                for (int pv : out[sv]) {
+                    for (int ov : out[pv]) tryTriple(sv, pv, ov);
+                }
+            }
+        }
+    };
+    rec(0);
+    return results;
+}
+
+// Apply rules until no new edges are derived. Each derivation appends a
+// chain to g.chains (so hover BFS sees it) and tags both edges of the
+// chain as derived so the entire consequent stands out visually.
+static void evaluateRules(Graph& g) {
+    if (g.rules.empty()) return;
+    g.firstDerivedChain = (int)g.chains.size();
+    // Track derived chains already produced (canonicalized as s|p|o node ids)
+    // so we don't append duplicates across fixpoint iterations.
+    std::unordered_set<uint64_t> seenChains;
+    auto chainKey = [](int s, int p, int o) {
+        return (uint64_t)(uint32_t)s * 0x9E3779B97F4A7C15ull
+             ^ ((uint64_t)(uint32_t)p << 1)
+             ^ ((uint64_t)(uint32_t)o * 0xBF58476D1CE4E5B9ull);
+    };
+    const int MAX_ITERS = 16;
+    for (int iter = 0; iter < MAX_ITERS; ++iter) {
+        bool changed = false;
+        for (auto& rule : g.rules) {
+            auto bindings = matchAntecedent(g, rule.antecedent);
+            for (auto& b : bindings) {
+                for (auto& tp : rule.consequent) {
+                    // Resolve / create each term to a concrete node id.
+                    // Unbound variables in the consequent leave the
+                    // derivation incomplete and are silently skipped.
+                    auto resolveOrCreate = [&](const Term& t) -> int {
+                        if (t.isVar) {
+                            auto it = b.find(t.name);
+                            if (it == b.end()) return -1;
+                            return it->second;
+                        }
+                        return g.getOrCreate(t.name);
+                    };
+                    int s = resolveOrCreate(tp.s);
+                    int p = resolveOrCreate(tp.p);
+                    int o = resolveOrCreate(tp.o);
+                    if (s < 0 || p < 0 || o < 0) continue;
+
+                    uint64_t key = chainKey(s, p, o);
+                    if (!seenChains.insert(key).second) continue; // already derived
+
+                    int eSizeBefore = (int)g.edges.size();
+                    int e1 = g.ensureEdge(s, p);
+                    int e2 = g.ensureEdge(p, o);
+                    bool addedNew = ((int)g.edges.size() > eSizeBefore);
+                    // Mark both edges of the derived chain as derived so the
+                    // user sees the entire consequent in the derived color.
+                    g.edges[e1].derived = true;
+                    g.edges[e2].derived = true;
+                    Chain c;
+                    c.nodeIds = {s, p, o};
+                    c.edgeIndices = {e1, e2};
+                    g.chains.push_back(std::move(c));
+                    if (addedNew) changed = true;
+                }
+            }
+        }
+        if (!changed) break;
+    }
 }
 
 static const char* kDefaultGraph =
@@ -854,9 +1157,15 @@ int main(int argc, char** argv) {
     Graph g;
     parseGraph(source, g);
     for (auto& e : g.parseErrors) std::fprintf(stderr, "parse: %s\n", e.c_str());
-    std::printf("graph: %d nodes, %d edges, %d chains, %d directives (h=%d hv=%d p=%d)\n",
+    int edgesBeforeRules  = (int)g.edges.size();
+    int chainsBeforeRules = (int)g.chains.size();
+    evaluateRules(g);
+    int derivedEdges  = (int)g.edges.size()  - edgesBeforeRules;
+    int derivedChains = (int)g.chains.size() - chainsBeforeRules;
+    std::printf("graph: %d nodes, %d edges, %d chains (rules:%d, derived %d chains/%d new edges) "
+                "directives: h=%d hv=%d p=%d\n",
         (int)g.nodes.size(), (int)g.edges.size(), (int)g.chains.size(),
-        (int)(g.highlights.size() + g.hovers.size() + g.paths.size()),
+        (int)g.rules.size(), derivedChains, derivedEdges,
         (int)g.highlights.size(), (int)g.hovers.size(), (int)g.paths.size());
 
     GraphIndex gi;
@@ -924,11 +1233,13 @@ int main(int argc, char** argv) {
     TextCache nodeText{ren, fontNode, {}};
     TextCache edgeText{ren, fontEdge, {}};
 
-    SDL_Color colBg     = {18, 20, 24, 255};
-    SDL_Color colEdge   = {110, 120, 140, 220};
-    SDL_Color colEdgeDim= {70, 78, 92, 90};
-    SDL_Color colEdgeHi = {255, 210, 110, 240};
-    SDL_Color colEdgeLbl= {170, 180, 200, 220};
+    SDL_Color colBg          = {18, 20, 24, 255};
+    SDL_Color colEdge        = {110, 120, 140, 220};
+    SDL_Color colEdgeDim     = {70, 78, 92, 90};
+    SDL_Color colEdgeHi      = {255, 210, 110, 240};
+    SDL_Color colEdgeDerived = {110, 230, 150, 240};   // green: derived by a rule
+    SDL_Color colEdgeDerivedDim = {60, 130, 90, 130};
+    SDL_Color colEdgeLbl     = {170, 180, 200, 220};
     SDL_Color colNode   = {130, 170, 240, 255};
     SDL_Color colNodeBd = {220, 230, 250, 255};
     SDL_Color colNodeDim= {70, 80, 100, 120};
@@ -1085,8 +1396,13 @@ int main(int argc, char** argv) {
                 worldToScreen(g.nodes[e.a].x, g.nodes[e.a].y, ax, ay);
                 worldToScreen(g.nodes[e.b].x, g.nodes[e.b].y, bx, by);
                 bool lit = edgeLit(ei);
-                SDL_Color c = lit ? (activeLit ? colEdgeHi : colEdge) : colEdgeDim;
-                int th = lit && activeLit ? shaftThickHi : shaftThick;
+                SDL_Color c;
+                if (e.derived) {
+                    c = lit ? colEdgeDerived : colEdgeDerivedDim;
+                } else {
+                    c = lit ? (activeLit ? colEdgeHi : colEdge) : colEdgeDim;
+                }
+                int th = (lit && activeLit) || e.derived ? shaftThickHi : shaftThick;
                 drawArrow(ren, ax, ay, bx, by, inset, th, headLen, headHalfW, c);
             }
         }

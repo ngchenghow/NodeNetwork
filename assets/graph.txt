@@ -3,6 +3,13 @@
 //highlight:crow
 //path:john->animal,show:shortest,search:edge
 
+# Rule: if A "will" B and C "isa" A, then C "will" B.
+# Derived edges show up in green.
+IF
+A->will->B AND C->isa->A
+THEN
+C->will->B
+
 hover:john
 man->will->talk
 bird->will->fly

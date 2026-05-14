@@ -33,6 +33,41 @@ Here `color`, `name`, and `eats` each become their own node, which lets
 relationship nodes attract their participants and act as visible hubs
 in the layout.
 
+## Rules (`IF ... THEN ...`)
+
+A graph file may also contain **inference rules**. The viewer evaluates them
+to a fixpoint after parsing and renders the **derived edges in green** so
+new facts are visually distinct.
+
+```
+IF
+A->will->B AND C->isa->A
+THEN
+C->will->B
+```
+
+Syntax:
+
+- A block starts on a line containing only `IF` (case-insensitive).
+- Body lines list triple patterns of the form `s->p->o`, joined with
+  `AND` (whole-word, case-insensitive). You can write all patterns on one
+  line, or split them across multiple lines.
+- A line containing only `THEN` switches to the consequent.
+- The consequent is one or more triple patterns. A **blank line ends the
+  rule**.
+- In a pattern, a token whose first character is an ASCII uppercase letter
+  (`A`, `Bird`, `X1`) is a **variable**. Everything else is a **constant**
+  (matches a literal node id, creating it for the consequent if needed).
+- Variables are shared across the antecedent patterns: the rule fires for
+  every assignment that satisfies all of them.
+
+Each successful firing produces a chain `s -> p -> o` (so hover BFS sees
+it like any other chain) and marks both edges as derived. Both edges of a
+derived chain render green — even if one of them already existed in the
+graph — so the whole rule output stands out.
+
+Evaluation iterates until no new edge is added, capped at 16 rounds.
+
 ## Highlight directives
 
 A graph file may contain directives that **light up part of the graph
