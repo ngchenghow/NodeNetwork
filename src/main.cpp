@@ -1381,15 +1381,46 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Effective lit set: mouse hover takes precedence over directive default.
-        int hovered = -1;
-        {
-            int mx, my; SDL_GetMouseState(&mx, &my);
-            hovered = pickNode(mx, my);
+        // Compute sidebar layout up front so we can both pick a hovered row
+        // and render it consistently below. Keep this in sync with the
+        // sidebar render block.
+        int sbX = winW - sidebarW;
+        int sbPadX = sbX + 14;
+        int sbHeaderH = (fontNode ? 26 : 0) + (fontEdge ? 22 : 0) + 14;
+        int sbRowH    = fontEdge ? TTF_FontLineSkip(fontEdge) + 2 : 18;
+        int sbRowsTop = sbHeaderH;
+        int sbRowsBot = winH - 24;
+        int sbVisibleRows = std::max(0, (sbRowsBot - sbRowsTop) / sbRowH);
+
+        int mouseX = 0, mouseY = 0;
+        SDL_GetMouseState(&mouseX, &mouseY);
+
+        // Pick which sentence row, if any, the mouse is over. Returns -1 if
+        // not over a row or if the mouse is outside the sidebar.
+        int hoveredSidebarChain = -1;
+        if (mouseX >= sbX && mouseY >= sbRowsTop && mouseY < sbRowsBot) {
+            int idx = (mouseY - sbRowsTop) / sbRowH;
+            if (idx >= 0 && idx < (int)g.chains.size() && idx < sbVisibleRows)
+                hoveredSidebarChain = idx;
         }
+
+        // Pick a graph node only when the mouse is in the graph area.
+        int hovered = -1;
+        if (mouseX < sbX) hovered = pickNode(mouseX, mouseY);
+
+        // Effective lit set. Priority:
+        //   1. mouse over a sidebar row  → only that chain
+        //   2. mouse over a graph node   → chain-head BFS from that node
+        //   3. directive default         → join of highlight/hover/path
+        //   4. nothing                   → everything lit
         const LitSet* activeLit = nullptr;
-        LitSet hoverLit;
-        if (hovered >= 0) {
+        LitSet sidebarLit, hoverLit;
+        if (hoveredSidebarChain >= 0) {
+            const auto& c = g.chains[hoveredSidebarChain];
+            for (int n : c.nodeIds)    sidebarLit.nodes.insert(n);
+            for (int e : c.edgeIndices) sidebarLit.edges.insert(e);
+            activeLit = &sidebarLit;
+        } else if (hovered >= 0) {
             hoverLit = litFromHover(g, gi, {g.nodes[hovered].id});
             activeLit = &hoverLit;
         } else if (defaultLit.active) {
@@ -1469,7 +1500,6 @@ int main(int argc, char** argv) {
 
         // ---------- sidebar: chains rendered as sentences ----------
         {
-            int sbX = winW - sidebarW;
             // Background panel + left divider line.
             SDL_SetRenderDrawColor(ren, 24, 26, 32, 255);
             SDL_Rect sbRect{sbX, 0, sidebarW, winH};
@@ -1477,11 +1507,10 @@ int main(int argc, char** argv) {
             SDL_SetRenderDrawColor(ren, 60, 66, 78, 255);
             SDL_RenderDrawLine(ren, sbX, 0, sbX, winH);
 
-            int padX = sbX + 14;
             int y = 14;
             if (fontNode) {
                 drawText(ren, nodeText, "Sentences",
-                         padX, y, SDL_Color{230, 235, 245, 255}, false, false);
+                         sbPadX, y, SDL_Color{230, 235, 245, 255}, false, false);
                 y += 26;
             }
             if (fontEdge) {
@@ -1491,9 +1520,10 @@ int main(int argc, char** argv) {
                     (int)g.chains.size(),
                     g.firstDerivedChain < 0 ? (int)g.chains.size() : g.firstDerivedChain,
                     g.firstDerivedChain < 0 ? 0 : (int)g.chains.size() - g.firstDerivedChain);
-                drawText(ren, edgeText, sub, padX, y, colEdgeLbl, false, false);
+                drawText(ren, edgeText, sub, sbPadX, y, colEdgeLbl, false, false);
                 y += 22;
             }
+            // y now equals sbRowsTop; double-check so the picker stays consistent.
 
             // A chain counts as lit if all its edges are in the active lit set
             // (or there is no active lit set, in which case everything is lit).
@@ -1509,12 +1539,23 @@ int main(int argc, char** argv) {
             SDL_Color colSentence    = {230, 235, 245, 255};
             SDL_Color colSentenceDim = {115, 122, 138, 230};
 
-            int rowH = fontEdge ? TTF_FontLineSkip(fontEdge) + 2 : 18;
             for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
-                if (y + rowH > winH - 24) break; // leave room for status line
+                if (y + sbRowH > sbRowsBot) break; // leave room for status line
                 const auto& c = g.chains[ci];
                 bool derived = (g.firstDerivedChain >= 0 && ci >= g.firstDerivedChain);
                 bool lit = chainLit(ci);
+                bool rowHovered = (ci == hoveredSidebarChain);
+
+                // Row hover background — strip the row in the chain's color
+                // at low alpha so you can see exactly which sentence is
+                // currently driving the graph highlight.
+                if (rowHovered) {
+                    SDL_Color hi = chainColors[ci];
+                    hi.a = 70;
+                    SDL_SetRenderDrawColor(ren, hi.r, hi.g, hi.b, hi.a);
+                    SDL_Rect rowRect{sbX + 4, y - 1, sidebarW - 8, sbRowH};
+                    SDL_RenderFillRect(ren, &rowRect);
+                }
 
                 // Build the sentence: join the chain's node ids with spaces.
                 std::string sentence;
@@ -1529,32 +1570,34 @@ int main(int argc, char** argv) {
                 SDL_Color bullet = chainColors[ci];
                 if (!lit) { bullet.a = 110; }
                 SDL_SetRenderDrawColor(ren, bullet.r, bullet.g, bullet.b, bullet.a);
-                fillCircle(ren, padX + 2, y + rowH / 2 - 2, 5);
+                fillCircle(ren, sbPadX + 2, y + sbRowH / 2 - 2, 5);
                 if (derived) {
                     // Hollow ring overlaid on the bullet marks derived chains.
                     SDL_SetRenderDrawColor(ren, 30, 32, 38, lit ? 255 : 180);
-                    fillCircle(ren, padX + 2, y + rowH / 2 - 2, 2);
+                    fillCircle(ren, sbPadX + 2, y + sbRowH / 2 - 2, 2);
                 }
 
                 SDL_Color col = lit ? colSentence : colSentenceDim;
                 if (fontEdge) drawText(ren, edgeText, sentence,
-                                       padX + 16, y, col, false, false);
-                y += rowH;
+                                       sbPadX + 16, y, col, false, false);
+                y += sbRowH;
             }
 
             // Footer legend
             if (fontEdge) {
                 int legendY = winH - 56;
                 drawText(ren, edgeText, "○ derived chain",
-                         padX, legendY, colEdgeLbl, false, false);
-                drawText(ren, edgeText, "hover a node to filter",
-                         padX, legendY + 18, colEdgeLbl, false, false);
+                         sbPadX, legendY, colEdgeLbl, false, false);
+                drawText(ren, edgeText, "hover a row to highlight its chain",
+                         sbPadX, legendY + 18, colEdgeLbl, false, false);
             }
         }
 
         // status line (along the bottom of the graph area, NOT the sidebar)
         if (fontEdge) {
-            const char* mode = (hovered >= 0) ? "hover" : (defaultLit.active ? "directive" : "all");
+            const char* mode = (hoveredSidebarChain >= 0) ? "sentence"
+                : (hovered >= 0) ? "hover"
+                : (defaultLit.active ? "directive" : "all");
             char buf[320];
             std::snprintf(buf, sizeof(buf),
                 "nodes:%d  edges:%d  chains:%d  zoom:%.2f  lit:%s  %s  "
