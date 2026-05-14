@@ -66,6 +66,14 @@ it like any other chain) and marks both edges as derived. Both edges of a
 derived chain render green — even if one of them already existed in the
 graph — so the whole rule output stands out.
 
+**Matching is chain-bounded.** A pattern triple matches only when
+`(s, p, o)` appears as a consecutive 3-window inside some chain — either
+an original source line or a chain produced by a previous rule firing.
+A 2-hop path that happens to exist in the directed graph but spans two
+unrelated chains at a shared hub node does *not* count, so the rule
+won't invent sentences like `bird will talk` from `bird->will->fly`
+plus `man->will->talk` just because both touch `will`.
+
 Evaluation iterates until no new edge is added, capped at 16 rounds.
 
 ## Highlight directives

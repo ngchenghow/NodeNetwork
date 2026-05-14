@@ -439,15 +439,16 @@ static bool unify(const Graph& g, const Term& t, int val,
 }
 
 // Find every assignment of the rule's variables that satisfies all antecedent
-// triples. Each triple matches the 2-hop pattern s -> p -> o in the directed
-// graph (i.e. there is an edge s->p AND an edge p->o).
+// triples. A triple `s->p->o` only matches if (s, p, o) appears as a
+// consecutive 3-window inside some chain (source line OR a chain previously
+// derived by a rule). This is stricter than walking the directed graph
+// blindly: a 2-hop path that joins two source chains at a shared middle node
+// is NOT a valid match. So `bird->will->talk` is not "a sentence" just
+// because `bird->will` (from `bird->will->fly`) and `will->talk` (from
+// `man->will->talk`) both happen to exist — there has to be a chain
+// containing all three tokens in order.
 static std::vector<std::unordered_map<std::string, int>>
 matchAntecedent(const Graph& g, const std::vector<TriplePattern>& pats) {
-    int n = (int)g.nodes.size();
-    std::vector<std::vector<int>> out(n);
-    std::vector<std::vector<int>> in(n);
-    for (auto& e : g.edges) { out[e.a].push_back(e.b); in[e.b].push_back(e.a); }
-
     std::vector<std::unordered_map<std::string, int>> results;
     std::unordered_map<std::string, int> binding;
 
@@ -455,47 +456,28 @@ matchAntecedent(const Graph& g, const std::vector<TriplePattern>& pats) {
         if (idx == pats.size()) { results.push_back(binding); return; }
         const auto& pat = pats[idx];
 
-        // Choose iteration strategy based on which of s/p/o is already pinned.
-        int pFix = resolveTerm(g, binding, pat.p);
+        // Pre-pin from current binding so we can early-reject windows.
         int sFix = resolveTerm(g, binding, pat.s);
+        int pFix = resolveTerm(g, binding, pat.p);
         int oFix = resolveTerm(g, binding, pat.o);
 
-        auto tryTriple = [&](int sv, int pv, int ov) {
-            auto saved = binding;
-            if (unify(g, pat.s, sv, binding) &&
-                unify(g, pat.p, pv, binding) &&
-                unify(g, pat.o, ov, binding)) {
-                rec(idx + 1);
-            }
-            binding = saved;
-        };
-
-        if (pFix >= 0) {
-            // Iterate predecessors X of p, then successors Y of p.
-            for (int sv : in[pFix]) {
+        for (const auto& c : g.chains) {
+            int len = (int)c.nodeIds.size();
+            if (len < 3) continue;
+            for (int j = 0; j + 2 < len; ++j) {
+                int sv = c.nodeIds[j];
+                int pv = c.nodeIds[j + 1];
+                int ov = c.nodeIds[j + 2];
                 if (sFix >= 0 && sFix != sv) continue;
-                for (int ov : out[pFix]) {
-                    if (oFix >= 0 && oFix != ov) continue;
-                    tryTriple(sv, pFix, ov);
+                if (pFix >= 0 && pFix != pv) continue;
+                if (oFix >= 0 && oFix != ov) continue;
+                auto saved = binding;
+                if (unify(g, pat.s, sv, binding) &&
+                    unify(g, pat.p, pv, binding) &&
+                    unify(g, pat.o, ov, binding)) {
+                    rec(idx + 1);
                 }
-            }
-        } else if (sFix >= 0) {
-            for (int pv : out[sFix]) {
-                for (int ov : out[pv]) {
-                    if (oFix >= 0 && oFix != ov) continue;
-                    tryTriple(sFix, pv, ov);
-                }
-            }
-        } else if (oFix >= 0) {
-            for (int pv : in[oFix]) {
-                for (int sv : in[pv]) tryTriple(sv, pv, oFix);
-            }
-        } else {
-            // All three free — iterate every 2-hop triple in the graph.
-            for (int sv = 0; sv < n; ++sv) {
-                for (int pv : out[sv]) {
-                    for (int ov : out[pv]) tryTriple(sv, pv, ov);
-                }
+                binding = saved;
             }
         }
     };
