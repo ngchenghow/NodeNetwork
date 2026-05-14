@@ -996,6 +996,32 @@ static void drawThickLine(SDL_Renderer* r, float x1, float y1, float x2, float y
     }
 }
 
+static SDL_Color hsv2rgb(float h, float s, float v, Uint8 alpha = 255) {
+    h = std::fmod(h, 360.f);
+    if (h < 0) h += 360.f;
+    float c = v * s;
+    float h60 = h / 60.f;
+    float x = c * (1.f - std::fabs(std::fmod(h60, 2.f) - 1.f));
+    float r1 = 0, g1 = 0, b1 = 0;
+    if (h60 < 1)      { r1 = c; g1 = x; b1 = 0; }
+    else if (h60 < 2) { r1 = x; g1 = c; b1 = 0; }
+    else if (h60 < 3) { r1 = 0; g1 = c; b1 = x; }
+    else if (h60 < 4) { r1 = 0; g1 = x; b1 = c; }
+    else if (h60 < 5) { r1 = x; g1 = 0; b1 = c; }
+    else              { r1 = c; g1 = 0; b1 = x; }
+    float m = v - c;
+    auto u8 = [](float f) { return (Uint8)std::clamp(int(std::round((f) * 255.f)), 0, 255); };
+    return { u8(r1 + m), u8(g1 + m), u8(b1 + m), alpha };
+}
+
+// Distinct color per chain index. Uses the golden angle (~137.508°) for
+// nicely spread hues; derived chains nudge into a slightly different
+// saturation/value band so the eye can still pick them out at a glance.
+static SDL_Color chainColor(int ci, bool derived) {
+    float hue = std::fmod(ci * 137.508f, 360.f);
+    return derived ? hsv2rgb(hue, 0.55f, 0.85f) : hsv2rgb(hue, 0.78f, 0.95f);
+}
+
 static void fillTriangle(SDL_Renderer* r, float ax, float ay, float bx, float by,
                          float cx, float cy, SDL_Color color) {
     SDL_Vertex v[3];
@@ -1154,6 +1180,18 @@ int main(int argc, char** argv) {
     gi.build(g);
     DefaultLit defaultLit = computeDefaultLit(g, gi);
 
+    // Precompute one color per chain and, for each edge, how many chains
+    // claim it. We render each chain's edges in its own color, offsetting
+    // shared edges perpendicularly so all participating chains stay visible.
+    std::vector<SDL_Color> chainColors(g.chains.size());
+    for (size_t ci = 0; ci < g.chains.size(); ++ci) {
+        bool derived = (g.firstDerivedChain >= 0 && (int)ci >= g.firstDerivedChain);
+        chainColors[ci] = chainColor((int)ci, derived);
+    }
+    std::vector<int> chainsPerEdge(g.edges.size(), 0);
+    for (auto& c : g.chains)
+        for (int ei : c.edgeIndices) chainsPerEdge[ei]++;
+
     // Sidebar lives on the right; graph area is everything to its left.
     const int sidebarW = 320;
     auto graphAreaW = [&]() { return std::max(200, winW - sidebarW); };
@@ -1219,13 +1257,8 @@ int main(int argc, char** argv) {
     TextCache nodeText{ren, fontNode, {}};
     TextCache edgeText{ren, fontEdge, {}};
 
-    SDL_Color colBg          = {18, 20, 24, 255};
-    SDL_Color colEdge        = {110, 120, 140, 220};
-    SDL_Color colEdgeDim     = {70, 78, 92, 90};
-    SDL_Color colEdgeHi      = {255, 210, 110, 240};
-    SDL_Color colEdgeDerived = {110, 230, 150, 240};   // green: derived by a rule
-    SDL_Color colEdgeDerivedDim = {60, 130, 90, 130};
-    SDL_Color colEdgeLbl     = {170, 180, 200, 220};
+    SDL_Color colBg      = {18, 20, 24, 255};
+    SDL_Color colEdgeLbl = {170, 180, 200, 220};
     SDL_Color colNode   = {130, 170, 240, 255};
     SDL_Color colNodeBd = {220, 230, 250, 255};
     SDL_Color colNodeDim= {70, 80, 100, 120};
@@ -1369,27 +1402,47 @@ int main(int argc, char** argv) {
         SDL_SetRenderDrawColor(ren, colBg.r, colBg.g, colBg.b, colBg.a);
         SDL_RenderClear(ren);
 
-        // edges
+        // edges: draw each chain's edges in its own color. Shared edges
+        // (the same edge index appearing in multiple chains) are offset
+        // perpendicularly so every participating chain stays visible.
         {
             float inset      = sim.nodeRadius * zoom + 1.f;
             float headLen    = std::max(8.f, 9.f * zoom);
             float headHalfW  = std::max(4.f, 5.f * zoom);
             int   shaftThick = std::max(1, (int)std::round(2.f * std::min(zoom, 1.5f)));
-            int   shaftThickHi = shaftThick + 2;
-            for (int ei = 0; ei < (int)g.edges.size(); ++ei) {
-                const auto& e = g.edges[ei];
-                float ax, ay, bx, by;
-                worldToScreen(g.nodes[e.a].x, g.nodes[e.a].y, ax, ay);
-                worldToScreen(g.nodes[e.b].x, g.nodes[e.b].y, bx, by);
-                bool lit = edgeLit(ei);
-                SDL_Color c;
-                if (e.derived) {
-                    c = lit ? colEdgeDerived : colEdgeDerivedDim;
-                } else {
-                    c = lit ? (activeLit ? colEdgeHi : colEdge) : colEdgeDim;
+            float perpStride = std::max(3.5f, 4.5f * std::min(zoom, 1.5f));
+
+            std::vector<int> drawIdx(g.edges.size(), 0);
+            for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
+                const auto& chain = g.chains[ci];
+                SDL_Color base = chainColors[ci];
+                for (size_t j = 0; j + 1 < chain.nodeIds.size(); ++j) {
+                    int ei = chain.edgeIndices[j];
+                    int sNode = chain.nodeIds[j];
+                    int oNode = chain.nodeIds[j + 1];
+                    bool lit = edgeLit(ei);
+                    SDL_Color col = base;
+                    col.a = lit ? 240 : 70;
+
+                    int total = chainsPerEdge[ei];
+                    int idx   = drawIdx[ei]++;
+                    float off = (idx - (total - 1) * 0.5f) * perpStride;
+
+                    float ax, ay, bx, by;
+                    worldToScreen(g.nodes[sNode].x, g.nodes[sNode].y, ax, ay);
+                    worldToScreen(g.nodes[oNode].x, g.nodes[oNode].y, bx, by);
+
+                    float dx = bx - ax, dy = by - ay;
+                    float len = std::sqrt(dx * dx + dy * dy);
+                    if (len > 0.1f && std::fabs(off) > 0.01f) {
+                        float px = -dy / len, py = dx / len;
+                        ax += px * off; ay += py * off;
+                        bx += px * off; by += py * off;
+                    }
+
+                    drawArrow(ren, ax, ay, bx, by, inset, shaftThick,
+                              headLen, headHalfW, col);
                 }
-                int th = (lit && activeLit) || e.derived ? shaftThickHi : shaftThick;
-                drawArrow(ren, ax, ay, bx, by, inset, th, headLen, headHalfW, c);
             }
         }
 
@@ -1455,8 +1508,6 @@ int main(int argc, char** argv) {
 
             SDL_Color colSentence    = {230, 235, 245, 255};
             SDL_Color colSentenceDim = {115, 122, 138, 230};
-            SDL_Color colSentenceDer = {130, 235, 165, 255};
-            SDL_Color colSentenceDerDim = {80, 150, 105, 230};
 
             int rowH = fontEdge ? TTF_FontLineSkip(fontEdge) + 2 : 18;
             for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
@@ -1471,25 +1522,31 @@ int main(int argc, char** argv) {
                     if (j) sentence += " ";
                     sentence += g.nodes[c.nodeIds[j]].id;
                 }
-                // Small marker dot in front of derived chains.
+                if (derived) sentence += "   (derived)";
+
+                // Bullet in this chain's color so the user can match a row
+                // in the sidebar against the matching trace in the graph.
+                SDL_Color bullet = chainColors[ci];
+                if (!lit) { bullet.a = 110; }
+                SDL_SetRenderDrawColor(ren, bullet.r, bullet.g, bullet.b, bullet.a);
+                fillCircle(ren, padX + 2, y + rowH / 2 - 2, 5);
                 if (derived) {
-                    SDL_Color dot = lit ? colSentenceDer : colSentenceDerDim;
-                    SDL_SetRenderDrawColor(ren, dot.r, dot.g, dot.b, dot.a);
-                    fillCircle(ren, padX, y + rowH / 2 - 2, 4);
+                    // Hollow ring overlaid on the bullet marks derived chains.
+                    SDL_SetRenderDrawColor(ren, 30, 32, 38, lit ? 255 : 180);
+                    fillCircle(ren, padX + 2, y + rowH / 2 - 2, 2);
                 }
-                int textX = derived ? padX + 12 : padX;
-                SDL_Color col = derived
-                    ? (lit ? colSentenceDer : colSentenceDerDim)
-                    : (lit ? colSentence    : colSentenceDim);
-                if (fontEdge) drawText(ren, edgeText, sentence, textX, y, col, false, false);
+
+                SDL_Color col = lit ? colSentence : colSentenceDim;
+                if (fontEdge) drawText(ren, edgeText, sentence,
+                                       padX + 16, y, col, false, false);
                 y += rowH;
             }
 
             // Footer legend
             if (fontEdge) {
                 int legendY = winH - 56;
-                drawText(ren, edgeText, "● derived by a rule",
-                         padX, legendY, SDL_Color{130, 235, 165, 230}, false, false);
+                drawText(ren, edgeText, "○ derived chain",
+                         padX, legendY, colEdgeLbl, false, false);
                 drawText(ren, edgeText, "hover a node to filter",
                          padX, legendY + 18, colEdgeLbl, false, false);
             }
