@@ -1427,7 +1427,19 @@ int main(int argc, char** argv) {
             activeLit = &defaultLit.set;
         }
         auto nodeLit = [&](int i) { return !activeLit || activeLit->nodes.count(i); };
-        auto edgeLit = [&](int i) { return !activeLit || activeLit->edges.count(i); };
+        // A chain is "lit" when every one of its edges is in the active lit
+        // set. This is the unit of highlighting for edges: a shared edge
+        // that appears in chain A and chain B will only light up via the
+        // chain that's actually selected — its parallel copy from the
+        // unselected chain stays dim.
+        auto chainIsLit = [&](int ci) {
+            if (!activeLit) return true;
+            const auto& c = g.chains[ci];
+            if (c.edgeIndices.empty()) return false;
+            for (int e : c.edgeIndices)
+                if (!activeLit->edges.count(e)) return false;
+            return true;
+        };
 
         // render
         SDL_SetRenderDrawColor(ren, colBg.r, colBg.g, colBg.b, colBg.a);
@@ -1447,13 +1459,13 @@ int main(int argc, char** argv) {
             for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
                 const auto& chain = g.chains[ci];
                 SDL_Color base = chainColors[ci];
+                bool lit = chainIsLit(ci);
                 for (size_t j = 0; j + 1 < chain.nodeIds.size(); ++j) {
                     int ei = chain.edgeIndices[j];
                     int sNode = chain.nodeIds[j];
                     int oNode = chain.nodeIds[j + 1];
-                    bool lit = edgeLit(ei);
                     SDL_Color col = base;
-                    col.a = lit ? 240 : 70;
+                    col.a = lit ? 240 : 55;
 
                     int total = chainsPerEdge[ei];
                     int idx   = drawIdx[ei]++;
@@ -1525,17 +1537,6 @@ int main(int argc, char** argv) {
             }
             // y now equals sbRowsTop; double-check so the picker stays consistent.
 
-            // A chain counts as lit if all its edges are in the active lit set
-            // (or there is no active lit set, in which case everything is lit).
-            auto chainLit = [&](int ci) {
-                if (!activeLit) return true;
-                const auto& c = g.chains[ci];
-                if (c.edgeIndices.empty()) return false;
-                for (int e : c.edgeIndices)
-                    if (!activeLit->edges.count(e)) return false;
-                return true;
-            };
-
             SDL_Color colSentence    = {230, 235, 245, 255};
             SDL_Color colSentenceDim = {115, 122, 138, 230};
 
@@ -1543,7 +1544,7 @@ int main(int argc, char** argv) {
                 if (y + sbRowH > sbRowsBot) break; // leave room for status line
                 const auto& c = g.chains[ci];
                 bool derived = (g.firstDerivedChain >= 0 && ci >= g.firstDerivedChain);
-                bool lit = chainLit(ci);
+                bool lit = chainIsLit(ci);
                 bool rowHovered = (ci == hoveredSidebarChain);
 
                 // Row hover background — strip the row in the chain's color
