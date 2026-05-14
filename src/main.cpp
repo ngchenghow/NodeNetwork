@@ -1172,14 +1172,18 @@ int main(int argc, char** argv) {
     gi.build(g);
     DefaultLit defaultLit = computeDefaultLit(g, gi);
 
-    // initial layout: spread nodes on a circle
+    // Sidebar lives on the right; graph area is everything to its left.
+    const int sidebarW = 320;
+    auto graphAreaW = [&]() { return std::max(200, winW - sidebarW); };
+
+    // initial layout: spread nodes on a circle inside the graph area
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> jitter(-30.f, 30.f);
     auto seedLayout = [&]() {
         int n = (int)g.nodes.size();
         if (n == 0) return;
-        float cx = winW * 0.5f, cy = winH * 0.5f;
-        float r = std::min(winW, winH) * 0.3f;
+        float cx = graphAreaW() * 0.5f, cy = winH * 0.5f;
+        float r = std::min(graphAreaW(), winH) * 0.3f;
         for (int i = 0; i < n; ++i) {
             float a = (float)i / std::max(1, n) * 6.2831853f;
             g.nodes[i].x = cx + r * std::cos(a) + jitter(rng);
@@ -1343,7 +1347,7 @@ int main(int argc, char** argv) {
                 fx[e.a] += f * dx / d; fy[e.a] += f * dy / d;
                 fx[e.b] -= f * dx / d; fy[e.b] -= f * dy / d;
             }
-            float cx = winW * 0.5f, cy = winH * 0.5f;
+            float cx = graphAreaW() * 0.5f, cy = winH * 0.5f;
             for (int i = 0; i < n; ++i) {
                 fx[i] += (cx - g.nodes[i].x) * sim.centerK;
                 fy[i] += (cy - g.nodes[i].y) * sim.centerK;
@@ -1428,7 +1432,88 @@ int main(int argc, char** argv) {
             }
         }
 
-        // status line
+        // ---------- sidebar: chains rendered as sentences ----------
+        {
+            int sbX = winW - sidebarW;
+            // Background panel + left divider line.
+            SDL_SetRenderDrawColor(ren, 24, 26, 32, 255);
+            SDL_Rect sbRect{sbX, 0, sidebarW, winH};
+            SDL_RenderFillRect(ren, &sbRect);
+            SDL_SetRenderDrawColor(ren, 60, 66, 78, 255);
+            SDL_RenderDrawLine(ren, sbX, 0, sbX, winH);
+
+            int padX = sbX + 14;
+            int y = 14;
+            if (fontNode) {
+                drawText(ren, nodeText, "Sentences",
+                         padX, y, SDL_Color{230, 235, 245, 255}, false, false);
+                y += 26;
+            }
+            if (fontEdge) {
+                char sub[160];
+                std::snprintf(sub, sizeof(sub),
+                    "%d total  (%d original, %d derived)",
+                    (int)g.chains.size(),
+                    g.firstDerivedChain < 0 ? (int)g.chains.size() : g.firstDerivedChain,
+                    g.firstDerivedChain < 0 ? 0 : (int)g.chains.size() - g.firstDerivedChain);
+                drawText(ren, edgeText, sub, padX, y, colEdgeLbl, false, false);
+                y += 22;
+            }
+
+            // A chain counts as lit if all its edges are in the active lit set
+            // (or there is no active lit set, in which case everything is lit).
+            auto chainLit = [&](int ci) {
+                if (!activeLit) return true;
+                const auto& c = g.chains[ci];
+                if (c.edgeIndices.empty()) return false;
+                for (int e : c.edgeIndices)
+                    if (!activeLit->edges.count(e)) return false;
+                return true;
+            };
+
+            SDL_Color colSentence    = {230, 235, 245, 255};
+            SDL_Color colSentenceDim = {115, 122, 138, 230};
+            SDL_Color colSentenceDer = {130, 235, 165, 255};
+            SDL_Color colSentenceDerDim = {80, 150, 105, 230};
+
+            int rowH = fontEdge ? TTF_FontLineSkip(fontEdge) + 2 : 18;
+            for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
+                if (y + rowH > winH - 24) break; // leave room for status line
+                const auto& c = g.chains[ci];
+                bool derived = (g.firstDerivedChain >= 0 && ci >= g.firstDerivedChain);
+                bool lit = chainLit(ci);
+
+                // Build the sentence: join the chain's node ids with spaces.
+                std::string sentence;
+                for (size_t j = 0; j < c.nodeIds.size(); ++j) {
+                    if (j) sentence += " ";
+                    sentence += g.nodes[c.nodeIds[j]].id;
+                }
+                // Small marker dot in front of derived chains.
+                if (derived) {
+                    SDL_Color dot = lit ? colSentenceDer : colSentenceDerDim;
+                    SDL_SetRenderDrawColor(ren, dot.r, dot.g, dot.b, dot.a);
+                    fillCircle(ren, padX, y + rowH / 2 - 2, 4);
+                }
+                int textX = derived ? padX + 12 : padX;
+                SDL_Color col = derived
+                    ? (lit ? colSentenceDer : colSentenceDerDim)
+                    : (lit ? colSentence    : colSentenceDim);
+                if (fontEdge) drawText(ren, edgeText, sentence, textX, y, col, false, false);
+                y += rowH;
+            }
+
+            // Footer legend
+            if (fontEdge) {
+                int legendY = winH - 56;
+                drawText(ren, edgeText, "● derived by a rule",
+                         padX, legendY, SDL_Color{130, 235, 165, 230}, false, false);
+                drawText(ren, edgeText, "hover a node to filter",
+                         padX, legendY + 18, colEdgeLbl, false, false);
+            }
+        }
+
+        // status line (along the bottom of the graph area, NOT the sidebar)
         if (fontEdge) {
             const char* mode = (hovered >= 0) ? "hover" : (defaultLit.active ? "directive" : "all");
             char buf[320];
@@ -1439,20 +1524,21 @@ int main(int argc, char** argv) {
                 zoom, mode, paused ? "PAUSED" : "running");
             drawText(ren, edgeText, buf, 10, winH - 18, colEdgeLbl, false, false);
 
-            // Show directive summary at the top
-            if (defaultLit.active || !g.parseErrors.empty()) {
+            // Directive summary in the top-left of the graph area.
+            if (defaultLit.active || !g.parseErrors.empty() || !g.rules.empty()) {
                 char top[320];
                 std::snprintf(top, sizeof(top),
-                    "directives: %d highlight / %d hover / %d path  (join:%s)",
+                    "directives: %d highlight / %d hover / %d path  rules: %d  (join:%s)",
                     (int)g.highlights.size(), (int)g.hovers.size(), (int)g.paths.size(),
+                    (int)g.rules.size(),
                     g.joinMode == JoinMode::Intersect ? "intersect" : "union");
                 drawText(ren, edgeText, top, 10, 8, colEdgeLbl, false, false);
-                int y = 26;
+                int yErr = 26;
                 for (auto& er : g.parseErrors) {
                     SDL_Color errC{255, 120, 120, 240};
-                    drawText(ren, edgeText, er, 10, y, errC, false, false);
-                    y += 16;
-                    if (y > 100) break;
+                    drawText(ren, edgeText, er, 10, yErr, errC, false, false);
+                    yErr += 16;
+                    if (yErr > 100) break;
                 }
             }
         }
