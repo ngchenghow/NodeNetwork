@@ -1090,8 +1090,27 @@ static void drawText(SDL_Renderer* r, TextCache& cache, const std::string& s,
 
 // ---------- font discovery ----------
 
+// CJK-capable fonts are listed first so Chinese / Japanese / Korean node
+// labels render with real glyphs instead of blank boxes. Microsoft YaHei
+// and friends also carry full Latin coverage, so the rest of the UI still
+// looks fine. Drop your own font at assets/font.ttf to override everything.
 static const char* candidateFonts[] = {
     "assets/font.ttf",
+    // Windows CJK
+    "C:/Windows/Fonts/msyh.ttc",     // Microsoft YaHei  (Simplified Chinese)
+    "C:/Windows/Fonts/msjh.ttc",     // Microsoft JhengHei (Traditional Chinese)
+    "C:/Windows/Fonts/simhei.ttf",   // SimHei
+    "C:/Windows/Fonts/simsun.ttc",   // SimSun
+    "C:/Windows/Fonts/malgun.ttf",   // Malgun Gothic (Korean, has CJK)
+    "C:/Windows/Fonts/msgothic.ttc", // MS Gothic (Japanese)
+    // Linux CJK
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    // macOS CJK
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    // Latin-only fallbacks (no CJK glyphs)
     "C:/Windows/Fonts/segoeui.ttf",
     "C:/Windows/Fonts/arial.ttf",
     "C:/Windows/Fonts/tahoma.ttf",

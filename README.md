@@ -187,11 +187,17 @@ powershell -ExecutionPolicy Bypass `
     -Exe build\NodeNetwork.exe
 ```
 
-The program searches for a TTF font in this order:
+The program searches for a TTF/TTC font in this order:
 
-1. `assets/font.ttf` (drop one here to bundle)
-2. Common Windows fonts (Segoe UI, Arial, ...)
-3. DejaVu Sans on Linux, Helvetica on macOS
+1. `assets/font.ttf` (drop one here to bundle / override)
+2. **CJK-capable system fonts** — Microsoft YaHei / JhengHei / SimHei / SimSun
+   on Windows, Noto Sans CJK / WenQuanYi on Linux, PingFang on macOS
+3. Latin-only fallbacks (Segoe UI, Arial, DejaVu Sans, Helvetica)
+
+Node ids are UTF-8, so Chinese / Japanese / Korean labels work as long as
+a CJK font is found — see [assets/example_chinese.txt](assets/example_chinese.txt).
+If CJK text shows as blank boxes, the picked font has no CJK glyphs: drop a
+CJK `.ttf`/`.otf` at `assets/font.ttf`.
 
 ## How it works
 

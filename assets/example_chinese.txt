@@ -1,0 +1,14 @@
+# Chinese sample - node ids can be any UTF-8 text.
+# Rule: if A "会" B and C "是" A, then C "会" B.
+IF
+A->会->B AND C->是->A
+THEN
+C->会->B
+
+hover:小明
+人->会->说话
+鸟->会->飞
+小明->是->人
+人->是->动物
+鸟->是->动物
+动物->会->死
