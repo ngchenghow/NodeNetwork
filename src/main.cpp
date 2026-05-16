@@ -1175,6 +1175,10 @@ int main(int argc, char** argv) {
     DefaultLit defaultLit;
     std::vector<SDL_Color> chainColors;
     std::vector<int>       chainsPerEdge;
+    // hasReverse[ei] = 1 if there is also an edge in the opposite direction
+    // between the same two nodes. Used to push twinned edges to one side of
+    // the perpendicular so go/return arrows don't overlap.
+    std::vector<char>      hasReverse;
 
     // (Re)load the graph file and rebuild every derived datastructure.
     // savedPositions, if provided, lets us preserve the on-screen position
@@ -1216,6 +1220,12 @@ int main(int argc, char** argv) {
         chainsPerEdge.assign(g.edges.size(), 0);
         for (auto& c : g.chains)
             for (int ei : c.edgeIndices) chainsPerEdge[ei]++;
+
+        hasReverse.assign(g.edges.size(), 0);
+        for (int ei = 0; ei < (int)g.edges.size(); ++ei) {
+            const auto& e = g.edges[ei];
+            if (g.edgeIndexByPair.count(packPair(e.b, e.a))) hasReverse[ei] = 1;
+        }
 
         // Restore positions for surviving nodes.
         if (savedPositions) {
@@ -1526,7 +1536,14 @@ int main(int argc, char** argv) {
 
                     int total = chainsPerEdge[ei];
                     int idx   = drawIdx[ei]++;
-                    float off = (idx - (total - 1) * 0.5f) * perpStride;
+                    float offBase = (total - 1) * 0.5f;
+                    float off = (idx - offBase) * perpStride;
+                    // If there's also an edge in the opposite direction, push
+                    // every draw of this directed edge to one perpendicular
+                    // side (positive). Because the perpendicular vector flips
+                    // when direction reverses, the twin's draws land on the
+                    // opposite side, so go and return arrows no longer overlap.
+                    if (hasReverse[ei]) off += (offBase + 0.5f) * perpStride;
 
                     float ax, ay, bx, by;
                     worldToScreen(g.nodes[sNode].x, g.nodes[sNode].y, ax, ay);
