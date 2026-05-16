@@ -130,6 +130,8 @@ unioned (default `join:union`).
 | --- | --- |
 | left-drag a node | pin and move it (release to unpin) |
 | mouse hover a node | transient highlight: chain-head BFS from that node (overrides directive default) |
+| mouse hover a sentence (right sidebar) | highlight only that chain in the graph |
+| **Refresh** button / `F5` | re-read the graph file from disk and rebuild (positions of surviving nodes are preserved) |
 | middle-drag / right-drag | pan |
 | mouse wheel | zoom |
 | `R` | reheat — randomize positions |

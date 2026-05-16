@@ -1167,50 +1167,69 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "No usable TTF font found. Drop one at assets/font.ttf\n");
     }
 
-    std::string source;
-    {
-        std::string path = (argc >= 2) ? argv[1] : "assets/graph.txt";
-        std::ifstream f(path);
+    // Path is kept around so the Refresh button (and F5) can re-read it.
+    std::string graphPath = (argc >= 2) ? argv[1] : "assets/graph.txt";
+
+    Graph g;
+    GraphIndex gi;
+    DefaultLit defaultLit;
+    std::vector<SDL_Color> chainColors;
+    std::vector<int>       chainsPerEdge;
+
+    // (Re)load the graph file and rebuild every derived datastructure.
+    // savedPositions, if provided, lets us preserve the on-screen position
+    // of nodes that survive the reload — small edits to graph.txt don't
+    // blow away the layout the user has been working with.
+    auto loadGraph = [&](const std::unordered_map<std::string, std::pair<float, float>>* savedPositions) {
+        std::string source;
+        std::ifstream f(graphPath);
         if (f) {
             std::stringstream ss; ss << f.rdbuf();
             source = ss.str();
-            std::printf("loaded graph: %s\n", path.c_str());
+            std::printf("loaded graph: %s\n", graphPath.c_str());
         } else {
-            std::printf("graph file not found, using default\n");
+            std::printf("graph file '%s' not found, using built-in default\n", graphPath.c_str());
             source = kDefaultGraph;
         }
-    }
+        g = Graph();
+        parseGraph(source, g);
+        for (auto& e : g.parseErrors) std::fprintf(stderr, "parse: %s\n", e.c_str());
+        int chainsBeforeRules = (int)g.chains.size();
+        int edgesBeforeRules  = (int)g.edges.size();
+        evaluateRules(g);
+        int derivedEdges  = (int)g.edges.size()  - edgesBeforeRules;
+        int derivedChains = (int)g.chains.size() - chainsBeforeRules;
+        std::printf("graph: %d nodes, %d edges, %d chains (rules:%d, derived %d chains/%d new edges) "
+                    "directives: h=%d hv=%d p=%d\n",
+            (int)g.nodes.size(), (int)g.edges.size(), (int)g.chains.size(),
+            (int)g.rules.size(), derivedChains, derivedEdges,
+            (int)g.highlights.size(), (int)g.hovers.size(), (int)g.paths.size());
 
-    Graph g;
-    parseGraph(source, g);
-    for (auto& e : g.parseErrors) std::fprintf(stderr, "parse: %s\n", e.c_str());
-    int edgesBeforeRules  = (int)g.edges.size();
-    int chainsBeforeRules = (int)g.chains.size();
-    evaluateRules(g);
-    int derivedEdges  = (int)g.edges.size()  - edgesBeforeRules;
-    int derivedChains = (int)g.chains.size() - chainsBeforeRules;
-    std::printf("graph: %d nodes, %d edges, %d chains (rules:%d, derived %d chains/%d new edges) "
-                "directives: h=%d hv=%d p=%d\n",
-        (int)g.nodes.size(), (int)g.edges.size(), (int)g.chains.size(),
-        (int)g.rules.size(), derivedChains, derivedEdges,
-        (int)g.highlights.size(), (int)g.hovers.size(), (int)g.paths.size());
+        gi.build(g);
+        defaultLit = computeDefaultLit(g, gi);
 
-    GraphIndex gi;
-    gi.build(g);
-    DefaultLit defaultLit = computeDefaultLit(g, gi);
+        chainColors.resize(g.chains.size());
+        for (size_t ci = 0; ci < g.chains.size(); ++ci) {
+            bool derived = (g.firstDerivedChain >= 0 && (int)ci >= g.firstDerivedChain);
+            chainColors[ci] = chainColor((int)ci, derived);
+        }
+        chainsPerEdge.assign(g.edges.size(), 0);
+        for (auto& c : g.chains)
+            for (int ei : c.edgeIndices) chainsPerEdge[ei]++;
 
-    // Precompute one color per chain and, for each edge, how many chains
-    // claim it. We render each chain's edges in its own color, offsetting
-    // shared edges perpendicularly so all participating chains stay visible.
-    std::vector<SDL_Color> chainColors(g.chains.size());
-    for (size_t ci = 0; ci < g.chains.size(); ++ci) {
-        bool derived = (g.firstDerivedChain >= 0 && (int)ci >= g.firstDerivedChain);
-        chainColors[ci] = chainColor((int)ci, derived);
-    }
-    std::vector<int> chainsPerEdge(g.edges.size(), 0);
-    for (auto& c : g.chains)
-        for (int ei : c.edgeIndices) chainsPerEdge[ei]++;
-
+        // Restore positions for surviving nodes.
+        if (savedPositions) {
+            for (auto& n : g.nodes) {
+                auto it = savedPositions->find(n.id);
+                if (it != savedPositions->end()) {
+                    n.x = it->second.first;
+                    n.y = it->second.second;
+                    n.vx = n.vy = 0;
+                }
+            }
+        }
+    };
+    loadGraph(nullptr);
     // Sidebar lives on the right; graph area is everything to its left.
     const int sidebarW = 320;
     auto graphAreaW = [&]() { return std::max(200, winW - sidebarW); };
@@ -1273,6 +1292,17 @@ int main(int argc, char** argv) {
         return best;
     };
 
+    // Refresh button: re-read graphPath, keep positions of surviving nodes.
+    auto refresh = [&]() {
+        std::unordered_map<std::string, std::pair<float, float>> saved;
+        saved.reserve(g.nodes.size());
+        for (auto& n : g.nodes) saved[n.id] = {n.x, n.y};
+        loadGraph(&saved);
+        // Drop stale interaction state — old indices may no longer be valid.
+        draggingNode = -1;
+        panning = false;
+    };
+
     TextCache nodeText{ren, fontNode, {}};
     TextCache edgeText{ren, fontEdge, {}};
 
@@ -1295,6 +1325,7 @@ int main(int argc, char** argv) {
                 case SDL_KEYDOWN:
                     if (ev.key.keysym.sym == SDLK_ESCAPE) running = false;
                     else if (ev.key.keysym.sym == SDLK_r) { seedLayout(); }
+                    else if (ev.key.keysym.sym == SDLK_F5) { refresh(); }
                     else if (ev.key.keysym.sym == SDLK_SPACE) paused = !paused;
                     break;
                 case SDL_WINDOWEVENT:
@@ -1305,6 +1336,13 @@ int main(int argc, char** argv) {
                     break;
                 case SDL_MOUSEBUTTONDOWN:
                     if (ev.button.button == SDL_BUTTON_LEFT) {
+                        // Refresh button intercepts clicks before node-picking.
+                        int rbX = winW - 100 - 12, rbY = 10, rbW = 100, rbH = 26;
+                        if (ev.button.x >= rbX && ev.button.x < rbX + rbW &&
+                            ev.button.y >= rbY && ev.button.y < rbY + rbH) {
+                            refresh();
+                            break;
+                        }
                         int idx = pickNode(ev.button.x, ev.button.y);
                         if (idx >= 0) {
                             draggingNode = idx;
@@ -1537,6 +1575,23 @@ int main(int argc, char** argv) {
             SDL_RenderFillRect(ren, &sbRect);
             SDL_SetRenderDrawColor(ren, 60, 66, 78, 255);
             SDL_RenderDrawLine(ren, sbX, 0, sbX, winH);
+
+            // Refresh button (top-right of the sidebar header).
+            SDL_Rect rb{winW - 100 - 12, 10, 100, 26};
+            bool rbHover = (mouseX >= rb.x && mouseX < rb.x + rb.w &&
+                            mouseY >= rb.y && mouseY < rb.y + rb.h);
+            SDL_Color rbBg = rbHover ? SDL_Color{60, 86, 128, 255}
+                                     : SDL_Color{40, 52, 70, 255};
+            SDL_SetRenderDrawColor(ren, rbBg.r, rbBg.g, rbBg.b, rbBg.a);
+            SDL_RenderFillRect(ren, &rb);
+            SDL_SetRenderDrawColor(ren, rbHover ? 150 : 100,
+                                        rbHover ? 180 : 120,
+                                        rbHover ? 220 : 150, 255);
+            SDL_RenderDrawRect(ren, &rb);
+            if (fontEdge)
+                drawText(ren, edgeText, "Refresh (F5)",
+                         rb.x + rb.w / 2, rb.y + rb.h / 2,
+                         SDL_Color{230, 240, 255, 255});
 
             int y = 14;
             if (fontNode) {
