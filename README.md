@@ -180,8 +180,12 @@ cmake --build build -j
 
 On Windows / MinGW the build automatically copies the SDL2 + GCC runtime
 DLLs next to `NodeNetwork.exe`, so you can double-click it or move the
-`build/` folder anywhere. To skip the gather step, pass
-`-DNODENETWORK_GATHER_DLLS=OFF` to `cmake`. To run the gather manually:
+`build/` folder anywhere. The binary is linked to the Windows GUI
+subsystem, so **no console window pops up** when launched from Explorer.
+If you'd rather have a console (handy for seeing `printf` debug output),
+reconfigure with `-DNODENETWORK_CONSOLE=ON`. To skip the runtime-DLL
+gather step, pass `-DNODENETWORK_GATHER_DLLS=OFF`. To run the gather
+manually:
 
 ```powershell
 powershell -ExecutionPolicy Bypass `

@@ -27,7 +27,16 @@ if(NOT SDL2_ttf_FOUND)
     find_package(SDL2_ttf QUIET)
 endif()
 
-add_executable(NodeNetwork src/main.cpp)
+# WIN32 puts the binary on the GUI subsystem (no console window pops up
+# when double-clicked). SDL2::SDL2main supplies the WinMain that bridges
+# to our int main() via the SDL_main macro. To get a console back for
+# debugging, configure with -DNODENETWORK_CONSOLE=ON.
+option(NODENETWORK_CONSOLE "Build as a console subsystem app (shows stdout)" OFF)
+if(WIN32 AND NOT NODENETWORK_CONSOLE)
+    add_executable(NodeNetwork WIN32 src/main.cpp)
+else()
+    add_executable(NodeNetwork src/main.cpp)
+endif()
 
 if(TARGET SDL2::SDL2main)
     target_link_libraries(NodeNetwork PRIVATE SDL2::SDL2main)
