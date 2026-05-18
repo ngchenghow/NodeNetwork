@@ -33,6 +33,56 @@ Here `color`, `name`, and `eats` each become their own node, which lets
 relationship nodes attract their participants and act as visible hubs
 in the layout.
 
+## PSCT closed loop (`psct:enable`)
+
+Implements *Path-Space Cognition Theory* (Ng, 2026) on top of the existing
+rule engine: deduction → analogy → induction as a self-driven loop.
+
+```
+psct:enable
+psct:theta=3
+psct:epsilon=0.0
+```
+
+Activate with the `psct:` directives at the top of a graph file. After the
+normal deduction fixpoint runs, the viewer:
+
+1. **Analogy step.** Enumerates every chain composition `X→λ₁→Y` ∘
+   `Y→λ₂→Z` currently in the contextual network. The pair `(λ₁, λ₂)` is
+   the path's edge-label sequence — PSCT's structural fingerprint.
+2. **Induction step.** For each `(λ₁, λ₂)` with support `|Supp| ≥ θ` and
+   counter-example ratio `|Cex|/|Supp| ≤ ε`, synthesises the rule
+   `IF X→λ₁→Y AND Y→λ₂→Z THEN X→λ₂→Z` and appends it to the rule set with
+   `induced=true`. (Counter-examples are `(X, Y)` pairs where `X→λ₁→Y`
+   exists but `Y` has no outgoing `λ₂` edge — the antecedent can't
+   chain.)
+3. **Re-deduce.** Calls `evaluateRules` again so the newly-induced rule
+   fires and extends the contextual network. The loop repeats until no
+   new rule is added (or 8 iterations as a safety cap).
+
+The demo graph in `assets/graph.txt` ships with **zero hand-written
+rules**. With `psct:enable, θ=3, ε=0` the engine reproduces the man /
+bird / john closed loop end-to-end:
+
+```
+PSCT: closed loop start: 6 chains, θ=3, ε=0.00
+PSCT: iter 1 analogy: 2 distinct (λ₁,λ₂) patterns
+PSCT:   (isa, will) supp=3 cex=0 ratio=0.00
+PSCT:   ↳ induced rule: IF X->isa->Y AND Y->will->Z THEN X->will->Z
+PSCT:   (isa, isa) supp=1 cex=2 ratio=2.00
+PSCT: iter 1 deduction with induced rules: +4 chains
+PSCT: iter 2: no new rules — loop terminates
+```
+
+Read top-down: deduction with the empty rule set derives nothing →
+analogy finds three `(isa, will)` compositions and one `(isa, isa)` →
+`(isa, will)` clears the θ/ε threshold so the transitivity rule is
+induced → re-running deduction with that rule produces four new chains
+(`john will talk`, `man will die`, `bird will die`, `john will die`).
+The induced rule and its statistics appear at the bottom of the right
+sidebar; the newly-derived sentences appear in the chain list, each in
+its own chain color.
+
 ## Rules (`IF ... THEN ...`)
 
 A graph file may also contain **inference rules**. The viewer evaluates them

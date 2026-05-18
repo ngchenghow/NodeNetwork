@@ -21,10 +21,13 @@
 #include <cstdio>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <queue>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -62,6 +65,23 @@ struct Rule {
     std::vector<TriplePattern> antecedent;
     std::vector<TriplePattern> consequent;
     int sourceLine = 0;
+
+    // PSCT bookkeeping: true if this rule was synthesised by the inductive
+    // folding step rather than written by the user.
+    bool induced     = false;
+    int  supportCount = 0; // |Supp| at induction time
+    int  counterCount = 0; // |Cex|  at induction time
+};
+
+// PSCT (Path-Space Cognition Theory) parameters governing the closed
+// deduction → analogy → induction loop. See doc/PSCT.pdf §5.
+//   theta   minimum support count before induction fires (paper's θ)
+//   epsilon maximum |Cex|/|Supp| ratio tolerated         (paper's ε)
+//   enabled set via the `psct:enable` directive in graph.txt
+struct PSCTParams {
+    int   theta   = 3;
+    float epsilon = 0.0f;
+    bool  enabled = false;
 };
 
 // A Chain is one source line, e.g. `bird->will->fly` becomes
@@ -105,7 +125,12 @@ struct Graph {
     // this came directly from source lines.
     int                       firstDerivedChain = -1;
 
+    PSCTParams                psct;
+
     std::vector<std::string>  parseErrors;
+    // Human-readable trace of the closed loop (one line per PSCT event).
+    // Printed to stdout and shown in the status / sidebar.
+    std::vector<std::string>  psctTrace;
 
     int getOrCreate(const std::string& id) {
         auto it = idIndex.find(id);
@@ -196,6 +221,36 @@ static bool tryDirective(Graph& g, const std::string& t, int lineNo) {
         if (v == "union")          g.joinMode = JoinMode::Union;
         else if (v == "intersect") g.joinMode = JoinMode::Intersect;
         else pushErr("join expects 'union' or 'intersect'");
+        return true;
+    }
+    // psct:enable / psct:theta=N / psct:epsilon=N.N
+    if (headLower == "psct") {
+        std::string v = rest;
+        std::string vl = v;
+        for (auto& c : vl) c = (char)std::tolower((unsigned char)c);
+        if (vl == "enable" || vl == "on" || vl == "true") {
+            g.psct.enabled = true;
+        } else if (vl == "disable" || vl == "off" || vl == "false") {
+            g.psct.enabled = false;
+        } else {
+            // expect key=value: theta=N or epsilon=F
+            auto eq = v.find('=');
+            if (eq == std::string::npos) {
+                pushErr("psct: expects 'enable', 'theta=N', or 'epsilon=N.N'");
+                return true;
+            }
+            std::string k = trim(v.substr(0, eq));
+            std::string val = trim(v.substr(eq + 1));
+            std::string kl = k;
+            for (auto& c : kl) c = (char)std::tolower((unsigned char)c);
+            try {
+                if (kl == "theta")        g.psct.theta   = std::stoi(val);
+                else if (kl == "epsilon") g.psct.epsilon = std::stof(val);
+                else pushErr("psct: unknown key '" + k + "'");
+            } catch (...) {
+                pushErr("psct: bad numeric value '" + val + "'");
+            }
+        }
         return true;
     }
     if (headLower == "highlight") {
@@ -543,6 +598,182 @@ static void evaluateRules(Graph& g) {
         }
         if (!changed) break;
     }
+}
+
+// ---------- PSCT: closed loop deduction → analogy → induction ----------
+//
+// `evaluateRules` (above) handles deduction: it fires hand-written and
+// already-induced rules over the chain set until fixpoint. The PSCT loop
+// wraps that with two additional steps:
+//
+//   Analogy step.   Enumerate every chain composition (X→λ₁→Y, Y→λ₂→Z)
+//                   that currently exists in C. The pair (λ₁, λ₂) is the
+//                   edge-label sequence of the resulting 2-hop path —
+//                   PSCT's structural fingerprint. Composition count is
+//                   the support set for the candidate rule template.
+//
+//   Induction step. For each (λ₁, λ₂) whose support count ≥ θ and whose
+//                   counter-example ratio ≤ ε, synthesise the rule
+//                       IF X→λ₁→Y AND Y→λ₂→Z THEN X→λ₂→Z
+//                   tag it `induced`, and append it to g.rules. A
+//                   counter-example here is a (X, Y) pair where X→λ₁→Y
+//                   exists but Y has no outgoing λ₂ edge (the antecedent
+//                   can't even chain forward to a candidate Z).
+//
+// After at least one rule is induced we re-run `evaluateRules`, which now
+// fires the newly-induced rules and lets their consequents extend C. The
+// whole loop repeats until no further rules are added, capped at MAX_PSCT.
+//
+// This implements §6.1 (Reasoning Closure) on PSCT graphs whose edges are
+// encoded predicate-as-node: each source-line chain (s, p, o) is treated
+// as one PSCT-edge s -[p]→ o.
+
+static void psctTrace(Graph& g, const std::string& msg) {
+    g.psctTrace.push_back(msg);
+    std::printf("PSCT: %s\n", msg.c_str());
+}
+
+static void runPSCTLoop(Graph& g) {
+    if (!g.psct.enabled) return;
+    const int MAX_PSCT = 8;
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "closed loop start: %d chains, θ=%d, ε=%.2f",
+        (int)g.chains.size(), g.psct.theta, g.psct.epsilon);
+    psctTrace(g, buf);
+
+    for (int iter = 1; iter <= MAX_PSCT; ++iter) {
+        // ---- analogy: tabulate (λ₁, λ₂) compositions ----
+        // chainsStartingAt[node] = chain indices whose first node == node.
+        std::unordered_map<int, std::vector<int>> chainsStartingAt;
+        for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
+            const auto& c = g.chains[ci];
+            if (c.nodeIds.size() >= 3)
+                chainsStartingAt[c.nodeIds[0]].push_back(ci);
+        }
+
+        // (λ₁, λ₂) → set of (X, Y, Z) compositions  (support set)
+        // (λ₁, λ₂) → set of (X, Y) pairs where Y has no λ₂ out-edge (cex)
+        std::map<std::pair<int,int>, std::set<std::tuple<int,int,int>>> supportByPattern;
+        std::map<std::pair<int,int>, std::set<std::pair<int,int>>>       cexByPattern;
+
+        for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
+            const auto& c1 = g.chains[ci];
+            if (c1.nodeIds.size() < 3) continue;
+            int X  = c1.nodeIds[0];
+            int l1 = c1.nodeIds[1];
+            int Y  = c1.nodeIds[2];
+            auto it = chainsStartingAt.find(Y);
+            if (it == chainsStartingAt.end()) continue;
+            for (int cj : it->second) {
+                const auto& c2 = g.chains[cj];
+                if (c2.nodeIds.size() < 3) continue;
+                int l2 = c2.nodeIds[1];
+                int Z  = c2.nodeIds[2];
+                supportByPattern[{l1, l2}].insert({X, Y, Z});
+            }
+        }
+
+        // Compute counter-examples per discovered pattern.
+        for (auto& kv : supportByPattern) {
+            int l1 = kv.first.first, l2 = kv.first.second;
+            for (auto& c : g.chains) {
+                if (c.nodeIds.size() < 3) continue;
+                if (c.nodeIds[1] != l1)   continue;
+                int X = c.nodeIds[0], Y = c.nodeIds[2];
+                bool yHasL2 = false;
+                auto it = chainsStartingAt.find(Y);
+                if (it != chainsStartingAt.end()) {
+                    for (int cj : it->second) {
+                        const auto& cc = g.chains[cj];
+                        if (cc.nodeIds.size() >= 3 && cc.nodeIds[1] == l2) {
+                            yHasL2 = true;
+                            break;
+                        }
+                    }
+                }
+                if (!yHasL2) cexByPattern[kv.first].insert({X, Y});
+            }
+        }
+
+        std::snprintf(buf, sizeof(buf),
+            "iter %d analogy: %d distinct (λ₁,λ₂) patterns",
+            iter, (int)supportByPattern.size());
+        psctTrace(g, buf);
+
+        // ---- induction: synthesise rules for high-support patterns ----
+        bool anyAdded = false;
+        // Sort patterns by support descending so the trace is readable.
+        std::vector<std::pair<std::pair<int,int>, int>> ordered;
+        for (auto& kv : supportByPattern)
+            ordered.emplace_back(kv.first, (int)kv.second.size());
+        std::sort(ordered.begin(), ordered.end(),
+                  [](auto& a, auto& b) { return a.second > b.second; });
+
+        for (auto& [pat, supp] : ordered) {
+            int cex = (int)cexByPattern[pat].size();
+            float ratio = supp > 0 ? (float)cex / (float)supp : 0.f;
+            const std::string& l1Name = g.nodes[pat.first].id;
+            const std::string& l2Name = g.nodes[pat.second].id;
+
+            std::snprintf(buf, sizeof(buf),
+                "  (%s, %s) supp=%d cex=%d ratio=%.2f",
+                l1Name.c_str(), l2Name.c_str(), supp, cex, ratio);
+            psctTrace(g, buf);
+
+            if (supp < g.psct.theta) continue;
+            if (ratio > g.psct.epsilon + 1e-6f) continue;
+
+            // Already induced for this (λ₁, λ₂)? Don't duplicate.
+            bool already = false;
+            for (auto& r : g.rules) {
+                if (!r.induced)                continue;
+                if (r.antecedent.size() != 2)  continue;
+                if (r.consequent.size() != 1)  continue;
+                if (r.antecedent[0].p.isVar)   continue;
+                if (r.antecedent[1].p.isVar)   continue;
+                if (r.antecedent[0].p.name == l1Name &&
+                    r.antecedent[1].p.name == l2Name) { already = true; break; }
+            }
+            if (already) continue;
+
+            // Synthesise the rule: IF X→λ₁→Y AND Y→λ₂→Z THEN X→λ₂→Z.
+            Rule r;
+            r.induced      = true;
+            r.sourceLine   = -1;
+            r.supportCount = supp;
+            r.counterCount = cex;
+            TriplePattern a1, a2, c;
+            a1.s = {true, "X"};   a1.p = {false, l1Name}; a1.o = {true, "Y"};
+            a2.s = {true, "Y"};   a2.p = {false, l2Name}; a2.o = {true, "Z"};
+            c .s = {true, "X"};   c .p = {false, l2Name}; c .o = {true, "Z"};
+            r.antecedent = {a1, a2};
+            r.consequent = {c};
+            g.rules.push_back(r);
+            anyAdded = true;
+
+            std::snprintf(buf, sizeof(buf),
+                "  ↳ induced rule: IF X->%s->Y AND Y->%s->Z THEN X->%s->Z",
+                l1Name.c_str(), l2Name.c_str(), l2Name.c_str());
+            psctTrace(g, buf);
+        }
+
+        if (!anyAdded) {
+            psctTrace(g, "iter " + std::to_string(iter) + ": no new rules — loop terminates");
+            break;
+        }
+        // Re-run deduction so the new rules can fire and grow C.
+        size_t chainsBefore = g.chains.size();
+        evaluateRules(g);
+        size_t newChains = g.chains.size() - chainsBefore;
+        std::snprintf(buf, sizeof(buf),
+            "iter %d deduction with induced rules: +%d chains",
+            iter, (int)newChains);
+        psctTrace(g, buf);
+    }
+    psctTrace(g, "closed loop done: " + std::to_string((int)g.chains.size()) + " chains, " +
+                  std::to_string((int)g.rules.size()) + " rules");
 }
 
 static const char* kDefaultGraph =
@@ -1201,13 +1432,17 @@ int main(int argc, char** argv) {
         int chainsBeforeRules = (int)g.chains.size();
         int edgesBeforeRules  = (int)g.edges.size();
         evaluateRules(g);
+        runPSCTLoop(g);
         int derivedEdges  = (int)g.edges.size()  - edgesBeforeRules;
         int derivedChains = (int)g.chains.size() - chainsBeforeRules;
-        std::printf("graph: %d nodes, %d edges, %d chains (rules:%d, derived %d chains/%d new edges) "
-                    "directives: h=%d hv=%d p=%d\n",
+        int handRules     = 0, indRules = 0;
+        for (auto& r : g.rules) (r.induced ? indRules : handRules)++;
+        std::printf("graph: %d nodes, %d edges, %d chains (rules:%d hand + %d induced, "
+                    "derived %d chains/%d new edges) directives: h=%d hv=%d p=%d  psct:%s\n",
             (int)g.nodes.size(), (int)g.edges.size(), (int)g.chains.size(),
-            (int)g.rules.size(), derivedChains, derivedEdges,
-            (int)g.highlights.size(), (int)g.hovers.size(), (int)g.paths.size());
+            handRules, indRules, derivedChains, derivedEdges,
+            (int)g.highlights.size(), (int)g.hovers.size(), (int)g.paths.size(),
+            g.psct.enabled ? "on" : "off");
 
         gi.build(g);
         defaultLit = computeDefaultLit(g, gi);
@@ -1675,9 +1910,49 @@ int main(int argc, char** argv) {
                 y += sbRowH;
             }
 
-            // Footer legend
+            // Footer legend & induced-rules summary
             if (fontEdge) {
-                int legendY = winH - 56;
+                // Count induced rules and reserve space for them at the bottom.
+                std::vector<int> inducedIdx;
+                for (int ri = 0; ri < (int)g.rules.size(); ++ri)
+                    if (g.rules[ri].induced) inducedIdx.push_back(ri);
+
+                int hintH    = 18;
+                int rowsForInduced = std::min((int)inducedIdx.size(), 3);
+                int blockH   = (inducedIdx.empty() ? 18 : 22 + rowsForInduced * 18) + hintH * 2;
+                int legendY  = winH - blockH;
+
+                if (!inducedIdx.empty()) {
+                    drawText(ren, edgeText, "PSCT induced rules:",
+                             sbPadX, legendY,
+                             SDL_Color{180, 230, 200, 240}, false, false);
+                    legendY += 20;
+                    for (int k = 0; k < rowsForInduced; ++k) {
+                        auto& r = g.rules[inducedIdx[k]];
+                        if (r.antecedent.size() == 2 && r.consequent.size() == 1) {
+                            const auto& l1 = r.antecedent[0].p.name;
+                            const auto& l2 = r.antecedent[1].p.name;
+                            char buf[200];
+                            std::snprintf(buf, sizeof(buf),
+                                "%s ∘ %s → %s   (supp=%d, cex=%d)",
+                                l1.c_str(), l2.c_str(), l2.c_str(),
+                                r.supportCount, r.counterCount);
+                            drawText(ren, edgeText, buf, sbPadX + 4,
+                                     legendY, SDL_Color{180, 230, 200, 235},
+                                     false, false);
+                            legendY += 18;
+                        }
+                    }
+                    if ((int)inducedIdx.size() > rowsForInduced) {
+                        char buf[80];
+                        std::snprintf(buf, sizeof(buf), "+ %d more",
+                                      (int)inducedIdx.size() - rowsForInduced);
+                        drawText(ren, edgeText, buf, sbPadX + 4, legendY,
+                                 SDL_Color{160, 190, 175, 220}, false, false);
+                        legendY += 18;
+                    }
+                    legendY += 4;
+                }
                 drawText(ren, edgeText, "○ derived chain",
                          sbPadX, legendY, colEdgeLbl, false, false);
                 drawText(ren, edgeText, "hover a row to highlight its chain",
