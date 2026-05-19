@@ -1,0 +1,63 @@
+# psct_demo3.txt — goal-directed PSCT demo exercising §4.3 fully.
+#
+# Unlike psct_demo.txt (scan mode, empty source template) and
+# psct_demo2.txt (cat/animal — also empty source template at DEDUCE
+# start), this demo predeclares a rule that lets DEDUCE take one
+# hop before dead-ending. The dead-end's edge-label sequence is the
+# *non-empty* source template Σ that the §4.3 analogical search uses
+# as its query — the "self-sourced analogy" mechanism of §4.1.
+#
+# Scenario: a medical-diagnosis micro-domain.
+#   - One predeclared rule lets the system go from a patient to a
+#     symptom via X->hasSymptom->Y entails X->suggests->Y.
+#   - From the symptom, no rule can extend the path to a treatment.
+#   - Analogy then searches for other suggests-paths whose terminals
+#     are within κ = m = 1 of the goal node 'aspirin' in C.
+#
+# Expected loop:
+#   1. DEDUCE(alice, aspirin) succeeds one hop (alice->suggests->fever)
+#      via the predeclared rule, then dead-ends at fever.
+#   2. sourceTemplate = (suggests). κ = m = 1.
+#   3. psctFindAnalogs(g, [suggests]) returns 3 analogs:
+#         alice->suggests->fever
+#         bob->suggests->headache
+#         carol->suggests->cough
+#   4. κ-bounded check filters by dist_G(aspirin, terminal):
+#         fever:    dist = 1 ≤ κ ✓
+#         headache: dist = 1 ≤ κ ✓
+#         cough:    dist > κ    ✗ (cough connects only to cough_syrup)
+#   5. confidence = (3/3) × (1/(1+1)) = 0.5 — STRICTLY LESS THAN 1.0.
+#   6. Two surviving analogs each produce predicted chain
+#      alice->suggests->aspirin (deduplicated to one in C, derived=true).
+#
+# This trace exercises every component of §4 that the original demos
+# bypass.
+
+psct:enable
+psct:theta=2
+psct:epsilon=0.00
+psct:start=alice
+psct:goal=aspirin
+
+# ---- Predeclared rule (the *only* rule supplied at startup) -----
+# A symptom in a patient is suggested as a candidate clinical fact
+# about that patient. This rule lets DEDUCE move one hop from a
+# patient to a symptom — non-trivially exercising §3.1 forward-chaining
+# before §4 is invoked.
+
+IF
+X->hasSymptom->Y
+THEN
+X->suggests->Y
+
+# ---- Patient symptom facts (in C, observed) ---------------------
+alice->hasSymptom->fever
+bob->hasSymptom->headache
+carol->hasSymptom->cough
+
+# ---- Background pharmacology (in C, observed) -------------------
+# These facts are NOT linked to patients by any rule. They provide
+# the connectivity that the §4.3 κ-bounded reachability check uses.
+headache->treatedBy->aspirin
+fever->treatedBy->aspirin
+cough->treatedBy->cough_syrup
