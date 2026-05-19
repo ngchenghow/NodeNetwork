@@ -1,23 +1,27 @@
-# PSCT demo on the man / bird / john knowledge graph.
+# PSCT closed loop demo (paper §3 → §4 → §5 → §3, full loop).
+# No hand-written rules — the engine has to discover everything.
 #
-# We start with no hand-written rules. Deduction alone derives nothing.
-# psct:enable turns on the closed loop:
-#   1. Deduction fixpoint → 0 new chains (no rules)
-#   2. Analogy step       → enumerate (λ₁, λ₂) chain compositions
-#   3. Induction step     → for any (λ₁, λ₂) with support ≥ θ and
-#                            cex-ratio ≤ ε, synthesise a rule
-#       IF X→λ₁→Y AND Y→λ₂→Z THEN X→λ₂→Z
-#   4. Deduction re-fires with the induced rule → new chains appear.
+# Goal: prove that john reaches "talk" by inference.
+#   §3 DEDUCE with R = ∅ → FAILs at john with empty fingerprint Σ.
+#   §4 analogy falls through to scan mode: enumerate every (λ₁, λ₂)
+#      chain composition in C as candidate templates.
+#   §5 induction folds (isa, will) into IF X→isa→Y AND Y→will→Z THEN
+#      X→will→Z when support clears θ and cex ratio clears ε.
+#   §3 DEDUCE re-runs with the induced rule and now reaches talk
+#      from john in two hops (john→isa→man → rule fires → john→will→talk).
 #
-# Run from a terminal to see the trace, or look at the induced-rules
-# panel in the sidebar.
+# Run from a terminal to see the trace, or check the right sidebar for
+# the induced rule and confidence-tagged derived sentences.
 
 psct:enable
 psct:theta=3
 psct:epsilon=0.0
+psct:start=john
+psct:goal=talk
 
 hover:john
 
+# Facts (C). Each chain is one PSCT-edge s -[label]→ o.
 man->will->talk
 bird->will->fly
 john->isa->man

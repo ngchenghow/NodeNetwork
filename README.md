@@ -38,6 +38,19 @@ in the layout.
 Implements *Path-Space Cognition Theory* (Ng, 2026) on top of the existing
 rule engine: deduction → analogy → induction as a self-driven loop.
 
+The implementation mirrors the paper's primitives:
+
+| paper § | function in [`src/main.cpp`](src/main.cpp) |
+| --- | --- |
+| §2.2 G_full / C separation | `Graph::gfullChains`, `Graph::chainConfidence` |
+| §3.1 DEDUCE (goal-directed BFS) | `psctDeduce`, returns `DeduceResult` with `partialLabels` Σ on FAIL |
+| §4.3 Step 2 analog search | `psctFindAnalogs(g, labelSeq)` |
+| §4.3 Step 3 τ-bounded reachability | `psctNodeDistance(g, t, u_m)` with κ = m |
+| §4.3 confidence | `psctConfidence(supp, cex, dist)` = (supp/(supp+cex)) × 1/(1+dist) |
+| §5.3 weighted support | `weightedSupportByPattern`, instance weight = `min(conf(C₁), conf(C₂))` |
+| §5.4 folding | rule synthesis inside `runPSCTLoop` |
+| §6.1 closed loop | `runPSCTLoop` (goal-directed → scan-mode → induction → re-deduce) |
+
 ```
 psct:enable
 psct:theta=3

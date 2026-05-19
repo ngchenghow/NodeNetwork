@@ -82,6 +82,13 @@ struct PSCTParams {
     int   theta   = 3;
     float epsilon = 0.0f;
     bool  enabled = false;
+    // Optional goal-directed mode: when both are set, the loop first runs
+    // psctDeduce(start → goal). On FAIL the failed-deduction's
+    // edge-label sequence becomes the analogy source template
+    // (paper §4.1 / §4.3 Step 1). Empty = scan mode (enumerate all
+    // (λ₁, λ₂) compositions, the engine's original behaviour).
+    std::string startNodeId;
+    std::string goalNodeId;
 };
 
 // A Chain is one source line, e.g. `bird->will->fly` becomes
@@ -126,6 +133,19 @@ struct Graph {
     int                       firstDerivedChain = -1;
 
     PSCTParams                psct;
+
+    // PSCT §2.2: G_full / C separation.
+    //   g.chains       = C  (contextual network): facts and confirmed
+    //                    derivations, rendered normally.
+    //   gfullChains    = G_full \ C: paths the system has *considered*
+    //                    (analog matches in particular) but has not
+    //                    committed as facts. Rendered as dashed dim
+    //                    arrows so the user can see what was explored.
+    //   chainConfidence: parallel to g.chains; 1.0 for source facts and
+    //                    deductive conclusions, < 1.0 for analogical
+    //                    predictions awaiting inductive confirmation.
+    std::vector<Chain>        gfullChains;
+    std::vector<float>        chainConfidence;
 
     std::vector<std::string>  parseErrors;
     // Human-readable trace of the closed loop (one line per PSCT event).
@@ -246,6 +266,8 @@ static bool tryDirective(Graph& g, const std::string& t, int lineNo) {
             try {
                 if (kl == "theta")        g.psct.theta   = std::stoi(val);
                 else if (kl == "epsilon") g.psct.epsilon = std::stof(val);
+                else if (kl == "goal")    g.psct.goalNodeId  = val;
+                else if (kl == "start")   g.psct.startNodeId = val;
                 else pushErr("psct: unknown key '" + k + "'");
             } catch (...) {
                 pushErr("psct: bad numeric value '" + val + "'");
@@ -460,6 +482,7 @@ static bool parseGraph(const std::string& text, Graph& g) {
             c.edgeIndices.push_back(ei);
         }
         g.chains.push_back(std::move(c));
+        g.chainConfidence.push_back(1.0f); // source facts: full confidence
     }
     flushRule(); // EOF inside a rule block
     return g.parseErrors.empty();
@@ -558,6 +581,13 @@ static void evaluateRules(Graph& g) {
     for (int iter = 0; iter < MAX_ITERS; ++iter) {
         bool changed = false;
         for (auto& rule : g.rules) {
+            // Confidence carried by a chain that this rule derives:
+            //   hand-written rule  → 1.0
+            //   induced rule       → support / (support + cex)
+            float ruleConf = rule.induced
+                ? (float)rule.supportCount /
+                      ((float)rule.supportCount + (float)rule.counterCount + 1e-6f)
+                : 1.0f;
             auto bindings = matchAntecedent(g, rule.antecedent);
             for (auto& b : bindings) {
                 for (auto& tp : rule.consequent) {
@@ -592,6 +622,7 @@ static void evaluateRules(Graph& g) {
                     c.nodeIds = {s, p, o};
                     c.edgeIndices = {e1, e2};
                     g.chains.push_back(std::move(c));
+                    g.chainConfidence.push_back(ruleConf);
                     if (addedNew) changed = true;
                 }
             }
@@ -633,19 +664,353 @@ static void psctTrace(Graph& g, const std::string& msg) {
     std::printf("PSCT: %s\n", msg.c_str());
 }
 
+// ---------- PSCT primitives (paper §3, §4, §5) ----------
+
+// Result of one goal-directed DEDUCE attempt (paper §3.1).
+//   success     true if a path from start → goal was found in C using R.
+//   On failure: partialPath / partialLabels record the longest path that
+//   the search reached, and deadEndNode is its terminal node. The label
+//   sequence is the structural fingerprint Σ = (λ₁, ..., λ_m) of §4.1
+//   and serves as the source template T for the analogy step.
+struct DeduceResult {
+    bool             success      = false;
+    int              goalNode     = -1;
+    int              deadEndNode  = -1;
+    std::vector<int> partialPath;   // node indices, length m+1
+    std::vector<int> partialLabels; // label-node indices, length m
+};
+
+// PSCT §3.1: forward-chaining BFS from start to goal over C, extending
+// edges via either (a) a chain directly present in C — these are
+// PSCT-edges of the contextual network — or (b) the consequent of any
+// rule in g.rules whose antecedent matches at the current node with the
+// subject variable bound to it. We track the longest path reached so we
+// can report a dead-end fingerprint on failure.
+static DeduceResult psctDeduce(Graph& g, int startNode, int goalNode) {
+    DeduceResult result;
+    result.goalNode = goalNode;
+    if (startNode < 0 || goalNode < 0) { result.deadEndNode = startNode; return result; }
+    if (startNode == goalNode) { result.success = true; result.partialPath = {startNode}; return result; }
+
+    struct State {
+        int node;
+        std::vector<int> pathNodes;
+        std::vector<int> pathLabels;
+    };
+    std::unordered_set<int> visited;
+    std::queue<State> frontier;
+    frontier.push({startNode, {startNode}, {}});
+    visited.insert(startNode);
+    State deepest = {startNode, {startNode}, {}};
+
+    while (!frontier.empty()) {
+        State cur = std::move(frontier.front()); frontier.pop();
+        if (cur.pathNodes.size() > deepest.pathNodes.size()) deepest = cur;
+
+        auto tryStep = [&](int labelNode, int nextNode) -> bool {
+            if (visited.count(nextNode)) return false;
+            visited.insert(nextNode);
+            std::vector<int> nN = cur.pathNodes;  nN.push_back(nextNode);
+            std::vector<int> nL = cur.pathLabels; nL.push_back(labelNode);
+            if (nextNode == goalNode) {
+                result.success = true;
+                result.partialPath   = std::move(nN);
+                result.partialLabels = std::move(nL);
+                return true;
+            }
+            frontier.push({nextNode, std::move(nN), std::move(nL)});
+            return false;
+        };
+
+        // §3.1: deduction extends C by *applying rules* in R. Chains in
+        // C are facts, not inference steps — they wouldn't extend the
+        // reasoning chain on their own. So we look only at rule-driven
+        // extensions; with R = ∅ the search fails at the start node and
+        // the empty fingerprint is returned to the caller (which falls
+        // back to scan-mode analogy).
+        for (auto& rule : g.rules) {
+            if (rule.antecedent.empty() || rule.consequent.empty()) continue;
+            auto bindings = matchAntecedent(g, rule.antecedent);
+            for (auto& b : bindings) {
+                const auto& firstPat = rule.antecedent.front();
+                int sub = firstPat.s.isVar
+                    ? (b.count(firstPat.s.name) ? b.at(firstPat.s.name) : -1)
+                    : g.findId(firstPat.s.name);
+                if (sub != cur.node) continue;
+                for (auto& tp : rule.consequent) {
+                    auto resolve = [&](const Term& t) -> int {
+                        if (t.isVar) {
+                            auto it = b.find(t.name);
+                            return it == b.end() ? -1 : it->second;
+                        }
+                        return g.findId(t.name);
+                    };
+                    int subj = resolve(tp.s), pred = resolve(tp.p), obj = resolve(tp.o);
+                    if (subj != cur.node || pred < 0 || obj < 0) continue;
+                    if (tryStep(pred, obj)) return result;
+                }
+            }
+        }
+    }
+
+    result.success      = false;
+    result.partialPath  = deepest.pathNodes;
+    result.partialLabels= deepest.pathLabels;
+    result.deadEndNode  = deepest.node;
+    return result;
+}
+
+// PSCT §4.3 Step 2: search C for all paths whose edge-label sequence
+// equals `labelSeq`. Each chain (s, p, o) is treated as a single
+// labeled edge s -[p]→ o. Returns the analog paths' node sequences.
+//
+// labelSeq[i] is the node-index of the label node for hop i.
+// Caps results at 500 to match the paper's MAX_PATHS guard.
+struct AnalogPath {
+    std::vector<int> nodeIds;  // length labelSeq.size() + 1
+    std::vector<int> labelIds; // same as labelSeq on success
+};
+
+static std::vector<AnalogPath> psctFindAnalogs(const Graph& g,
+                                              const std::vector<int>& labelSeq) {
+    std::vector<AnalogPath> results;
+    if (labelSeq.empty()) return results;
+    const int m = (int)labelSeq.size();
+
+    // Index edges (chains) by their label node, for label-filtered BFS.
+    std::unordered_map<int, std::vector<std::pair<int,int>>> edgesByLabel;
+    for (auto& chain : g.chains) {
+        if (chain.nodeIds.size() < 3) continue;
+        edgesByLabel[chain.nodeIds[1]].emplace_back(chain.nodeIds[0], chain.nodeIds[2]);
+    }
+
+    struct SearchState { int node; std::vector<int> pathNodes; };
+    auto it0 = edgesByLabel.find(labelSeq[0]);
+    if (it0 == edgesByLabel.end()) return results;
+
+    std::queue<SearchState> q;
+    for (auto& [X, Y] : it0->second) q.push({Y, {X, Y}});
+
+    while (!q.empty()) {
+        SearchState cur = std::move(q.front()); q.pop();
+        int step = (int)cur.pathNodes.size() - 1;
+        if (step == m) {
+            AnalogPath ap;
+            ap.nodeIds  = std::move(cur.pathNodes);
+            ap.labelIds = labelSeq;
+            results.push_back(std::move(ap));
+            if ((int)results.size() >= 500) break;
+            continue;
+        }
+        auto it = edgesByLabel.find(labelSeq[step]);
+        if (it == edgesByLabel.end()) continue;
+        for (auto& [X2, Y2] : it->second) {
+            if (X2 != cur.node) continue;
+            SearchState nx{Y2, cur.pathNodes};
+            nx.pathNodes.push_back(Y2);
+            q.push(std::move(nx));
+        }
+    }
+    return results;
+}
+
+// PSCT §4.3 Step 3: undirected BFS distance between two nodes over C.
+// Returns -1 if unreachable. Used for the τ-bounded reachability check.
+static int psctNodeDistance(const Graph& g, int a, int b) {
+    if (a == b) return 0;
+    int n = (int)g.nodes.size();
+    if (a < 0 || b < 0 || a >= n || b >= n) return -1;
+    std::vector<std::vector<int>> adj(n);
+    for (auto& chain : g.chains) {
+        if (chain.nodeIds.size() < 3) continue;
+        adj[chain.nodeIds[0]].push_back(chain.nodeIds[2]);
+        adj[chain.nodeIds[2]].push_back(chain.nodeIds[0]);
+    }
+    std::vector<int> dist(n, -1);
+    dist[a] = 0;
+    std::queue<int> q; q.push(a);
+    while (!q.empty()) {
+        int cur = q.front(); q.pop();
+        if (cur == b) return dist[cur];
+        for (int nb : adj[cur])
+            if (dist[nb] == -1) { dist[nb] = dist[cur] + 1; q.push(nb); }
+    }
+    return -1;
+}
+
+// PSCT §4.3: conf(A, t) = evidentialQuality × distancePenalty.
+//   evidentialQuality = |Supp_analog| / (|Supp_analog| + |Cex_analog|)
+//   distancePenalty   = 1 / (1 + dist_G(t, u_m))
+// Using (1 + dist) keeps the formula finite when u_m = t.
+static float psctConfidence(int suppAnalog, int cexAnalog, int dist) {
+    if (suppAnalog <= 0) return 0.0f;
+    float quality = (float)suppAnalog /
+                    ((float)suppAnalog + (float)cexAnalog + 1e-6f);
+    float penalty = 1.0f / (1.0f + (float)std::max(0, dist));
+    return quality * penalty;
+}
+
 static void runPSCTLoop(Graph& g) {
     if (!g.psct.enabled) return;
     const int MAX_PSCT = 8;
 
-    char buf[256];
+    char buf[320];
     std::snprintf(buf, sizeof(buf),
-        "closed loop start: %d chains, θ=%d, ε=%.2f",
-        (int)g.chains.size(), g.psct.theta, g.psct.epsilon);
+        "closed loop start: %d chains, θ=%d, ε=%.2f%s%s",
+        (int)g.chains.size(), g.psct.theta, g.psct.epsilon,
+        g.psct.goalNodeId.empty() ? " (scan mode)" : " (goal=",
+        g.psct.goalNodeId.empty() ? "" : (g.psct.goalNodeId + ")").c_str());
     psctTrace(g, buf);
 
+    // ---- §3 / §4.1 Goal-directed DEDUCE (optional) ----
+    // If psct:goal=… (and optionally psct:start=…) is set, try a forward
+    // search first. On SUCCESS the loop exits without firing analogy
+    // (deduction is enough). On FAIL the dead-end's edge-label sequence
+    // is the source template Σ for the analogy step.
+    std::vector<int> sourceTemplate;
+    int startNode = -1, goalNode = -1, deadEndNode = -1;
+    bool goalDirected = !g.psct.goalNodeId.empty();
+    if (goalDirected) {
+        goalNode  = g.findId(g.psct.goalNodeId);
+        startNode = g.psct.startNodeId.empty() ? -1 : g.findId(g.psct.startNodeId);
+        if (goalNode < 0) {
+            psctTrace(g, "psct:goal node '" + g.psct.goalNodeId + "' not in graph");
+            goalDirected = false;
+        } else if (startNode < 0 && !g.psct.startNodeId.empty()) {
+            psctTrace(g, "psct:start node '" + g.psct.startNodeId + "' not in graph");
+            goalDirected = false;
+        }
+    }
+    if (goalDirected) {
+        DeduceResult dr = psctDeduce(g, startNode, goalNode);
+        if (dr.success) {
+            std::snprintf(buf, sizeof(buf),
+                "§3 DEDUCE %s -> %s succeeded in %d hop(s) — no analogy needed",
+                g.nodes[startNode].id.c_str(), g.nodes[goalNode].id.c_str(),
+                (int)dr.partialLabels.size());
+            psctTrace(g, buf);
+            return;
+        }
+        sourceTemplate = dr.partialLabels;
+        deadEndNode    = dr.deadEndNode;
+        std::snprintf(buf, sizeof(buf),
+            "§3 DEDUCE FAIL at %s after %d hop(s) — fingerprint Σ=(%s)",
+            g.nodes[deadEndNode].id.c_str(),
+            (int)sourceTemplate.size(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < sourceTemplate.size(); ++i) {
+                    if (i) s += ",";
+                    s += g.nodes[sourceTemplate[i]].id;
+                }
+                return s;
+            }().c_str());
+        psctTrace(g, buf);
+    }
+
     for (int iter = 1; iter <= MAX_PSCT; ++iter) {
-        // ---- analogy: tabulate (λ₁, λ₂) compositions ----
-        // chainsStartingAt[node] = chain indices whose first node == node.
+        // ===== §4 ANALOGY =====
+        //
+        // Two modes:
+        //  - Goal-directed: search G_full for paths isomorphic to the
+        //    source template Σ from the failed deduction, then check
+        //    each analog's terminal against τ-bounded reachability to
+        //    the original goal. Successful analogs add a low-confidence
+        //    predicted chain (deadEndNode → goalNode).
+        //  - Scan: enumerate every (λ₁, λ₂) chain composition in C and
+        //    treat each as a candidate template for induction.
+        if (goalDirected && !sourceTemplate.empty()) {
+            int kappa = (int)sourceTemplate.size(); // §7.3: κ = m
+            auto analogs = psctFindAnalogs(g, sourceTemplate);
+            // §4.3: Cex_analog = analogs of the (m-1)-prefix that cannot
+            // be extended with the final label.
+            int cexAnalog = 0;
+            if (sourceTemplate.size() > 1) {
+                std::vector<int> prefix(sourceTemplate.begin(),
+                                        sourceTemplate.end() - 1);
+                auto prefAnalogs = psctFindAnalogs(g, prefix);
+                int lastL = sourceTemplate.back();
+                for (auto& pa : prefAnalogs) {
+                    int tail = pa.nodeIds.back();
+                    bool canExt = false;
+                    for (auto& c : g.chains) {
+                        if (c.nodeIds.size() < 3) continue;
+                        if (c.nodeIds[0] == tail && c.nodeIds[1] == lastL) {
+                            canExt = true; break;
+                        }
+                    }
+                    if (!canExt) ++cexAnalog;
+                }
+            }
+            std::snprintf(buf, sizeof(buf),
+                "§4 analogy: %d analogs, %d prefix-only (cex), κ=%d",
+                (int)analogs.size(), cexAnalog, kappa);
+            psctTrace(g, buf);
+
+            // Store analog paths into G_full so the UI shows them dashed.
+            g.gfullChains.clear();
+            for (auto& ap : analogs) {
+                Chain gc;
+                gc.nodeIds = ap.nodeIds;
+                g.gfullChains.push_back(std::move(gc));
+            }
+
+            // For each analog whose terminal is within τ = κ of the
+            // original goal, generate a predicted chain dead→goal with
+            // computed confidence (§4.3 Step 3).
+            bool addedPrediction = false;
+            for (auto& ap : analogs) {
+                int um = ap.nodeIds.back();
+                int dist = psctNodeDistance(g, goalNode, um);
+                if (dist < 0 || dist > kappa) continue;
+                float conf = psctConfidence((int)analogs.size(), cexAnalog, dist);
+
+                if (deadEndNode < 0 || goalNode < 0) continue;
+                // The predicted chain itself: dead→<bridge>→goal. We
+                // collapse the bridge to a single edge for the toy
+                // domain — the predicted PSCT-edge is whatever label
+                // the analog's terminal carries forward (the last
+                // template label). When dist == 0 (um == goal),
+                // the prediction is direct.
+                int bridgeLabel = sourceTemplate.back();
+                // Avoid pushing duplicates.
+                bool exists = false;
+                for (auto& c : g.chains) {
+                    if (c.nodeIds.size() == 3 &&
+                        c.nodeIds[0] == deadEndNode &&
+                        c.nodeIds[1] == bridgeLabel &&
+                        c.nodeIds[2] == goalNode) { exists = true; break; }
+                }
+                if (exists) continue;
+
+                Chain pred;
+                pred.nodeIds = {deadEndNode, bridgeLabel, goalNode};
+                pred.edgeIndices = {
+                    g.ensureEdge(deadEndNode, bridgeLabel),
+                    g.ensureEdge(bridgeLabel, goalNode)
+                };
+                g.edges[pred.edgeIndices[0]].derived = true;
+                g.edges[pred.edgeIndices[1]].derived = true;
+                g.chains.push_back(std::move(pred));
+                g.chainConfidence.push_back(conf);
+                addedPrediction = true;
+                std::snprintf(buf, sizeof(buf),
+                    "  ↳ predict %s -%s-> %s  (conf=%.2f, dist=%d, κ=%d)",
+                    g.nodes[deadEndNode].id.c_str(),
+                    g.nodes[bridgeLabel].id.c_str(),
+                    g.nodes[goalNode].id.c_str(),
+                    conf, dist, kappa);
+                psctTrace(g, buf);
+            }
+            (void)addedPrediction;
+            // After first iteration of goal-directed analogy, switch to
+            // scan mode for induction — predictions added above will
+            // contribute weighted support.
+            sourceTemplate.clear();
+            goalDirected = false;
+        }
+
+        // ---- analogy: tabulate (λ₁, λ₂) compositions over C ----
         std::unordered_map<int, std::vector<int>> chainsStartingAt;
         for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
             const auto& c = g.chains[ci];
@@ -653,30 +1018,34 @@ static void runPSCTLoop(Graph& g) {
                 chainsStartingAt[c.nodeIds[0]].push_back(ci);
         }
 
-        // (λ₁, λ₂) → set of (X, Y, Z) compositions  (support set)
-        // (λ₁, λ₂) → set of (X, Y) pairs where Y has no λ₂ out-edge (cex)
-        std::map<std::pair<int,int>, std::set<std::tuple<int,int,int>>> supportByPattern;
-        std::map<std::pair<int,int>, std::set<std::pair<int,int>>>       cexByPattern;
+        // Weighted support: (λ₁, λ₂) → (X, Y, Z) → instance weight.
+        // Weight = min(conf(C₁), conf(C₂)) — conservative: a composition
+        // is no stronger than its weakest link.
+        std::map<std::pair<int,int>,
+                 std::map<std::tuple<int,int,int>, float>>
+            weightedSupportByPattern;
+        std::map<std::pair<int,int>, std::set<std::pair<int,int>>> cexByPattern;
 
         for (int ci = 0; ci < (int)g.chains.size(); ++ci) {
             const auto& c1 = g.chains[ci];
             if (c1.nodeIds.size() < 3) continue;
-            int X  = c1.nodeIds[0];
-            int l1 = c1.nodeIds[1];
-            int Y  = c1.nodeIds[2];
+            float w1 = (ci < (int)g.chainConfidence.size())
+                     ? g.chainConfidence[ci] : 1.0f;
+            int X = c1.nodeIds[0], l1 = c1.nodeIds[1], Y = c1.nodeIds[2];
             auto it = chainsStartingAt.find(Y);
             if (it == chainsStartingAt.end()) continue;
             for (int cj : it->second) {
                 const auto& c2 = g.chains[cj];
                 if (c2.nodeIds.size() < 3) continue;
-                int l2 = c2.nodeIds[1];
-                int Z  = c2.nodeIds[2];
-                supportByPattern[{l1, l2}].insert({X, Y, Z});
+                float w2 = (cj < (int)g.chainConfidence.size())
+                         ? g.chainConfidence[cj] : 1.0f;
+                int l2 = c2.nodeIds[1], Z = c2.nodeIds[2];
+                weightedSupportByPattern[{l1, l2}][{X, Y, Z}] =
+                    std::min(w1, w2);
             }
         }
-
-        // Compute counter-examples per discovered pattern.
-        for (auto& kv : supportByPattern) {
+        // Counter-examples: X→λ₁→Y but Y has no λ₂ out-edge.
+        for (auto& kv : weightedSupportByPattern) {
             int l1 = kv.first.first, l2 = kv.first.second;
             for (auto& c : g.chains) {
                 if (c.nodeIds.size() < 3) continue;
@@ -688,8 +1057,7 @@ static void runPSCTLoop(Graph& g) {
                     for (int cj : it->second) {
                         const auto& cc = g.chains[cj];
                         if (cc.nodeIds.size() >= 3 && cc.nodeIds[1] == l2) {
-                            yHasL2 = true;
-                            break;
+                            yHasL2 = true; break;
                         }
                     }
                 }
@@ -698,51 +1066,52 @@ static void runPSCTLoop(Graph& g) {
         }
 
         std::snprintf(buf, sizeof(buf),
-            "iter %d analogy: %d distinct (λ₁,λ₂) patterns",
-            iter, (int)supportByPattern.size());
+            "iter %d §5 weighted analogy: %d distinct (λ₁,λ₂) patterns",
+            iter, (int)weightedSupportByPattern.size());
         psctTrace(g, buf);
 
-        // ---- induction: synthesise rules for high-support patterns ----
+        // ===== §5 INDUCTION =====
         bool anyAdded = false;
-        // Sort patterns by support descending so the trace is readable.
-        std::vector<std::pair<std::pair<int,int>, int>> ordered;
-        for (auto& kv : supportByPattern)
-            ordered.emplace_back(kv.first, (int)kv.second.size());
+        std::vector<std::pair<std::pair<int,int>, float>> ordered;
+        ordered.reserve(weightedSupportByPattern.size());
+        for (auto& kv : weightedSupportByPattern) {
+            float w = 0.f;
+            for (auto& t : kv.second) w += t.second;
+            ordered.emplace_back(kv.first, w);
+        }
         std::sort(ordered.begin(), ordered.end(),
                   [](auto& a, auto& b) { return a.second > b.second; });
 
-        for (auto& [pat, supp] : ordered) {
-            int cex = (int)cexByPattern[pat].size();
-            float ratio = supp > 0 ? (float)cex / (float)supp : 0.f;
+        for (auto& [pat, weightedSupp] : ordered) {
+            int rawSupp = (int)weightedSupportByPattern[pat].size();
+            int cex     = (int)cexByPattern[pat].size();
+            float ratio = rawSupp > 0 ? (float)cex / (float)rawSupp : 0.f;
             const std::string& l1Name = g.nodes[pat.first].id;
             const std::string& l2Name = g.nodes[pat.second].id;
 
             std::snprintf(buf, sizeof(buf),
-                "  (%s, %s) supp=%d cex=%d ratio=%.2f",
-                l1Name.c_str(), l2Name.c_str(), supp, cex, ratio);
+                "  (%s, %s) wSupp=%.2f rawSupp=%d cex=%d ratio=%.2f",
+                l1Name.c_str(), l2Name.c_str(),
+                weightedSupp, rawSupp, cex, ratio);
             psctTrace(g, buf);
 
-            if (supp < g.psct.theta) continue;
+            if (weightedSupp + 1e-6f < (float)g.psct.theta) continue;
             if (ratio > g.psct.epsilon + 1e-6f) continue;
 
-            // Already induced for this (λ₁, λ₂)? Don't duplicate.
             bool already = false;
             for (auto& r : g.rules) {
-                if (!r.induced)                continue;
-                if (r.antecedent.size() != 2)  continue;
-                if (r.consequent.size() != 1)  continue;
-                if (r.antecedent[0].p.isVar)   continue;
-                if (r.antecedent[1].p.isVar)   continue;
+                if (!r.induced) continue;
+                if (r.antecedent.size() != 2 || r.consequent.size() != 1) continue;
+                if (r.antecedent[0].p.isVar || r.antecedent[1].p.isVar) continue;
                 if (r.antecedent[0].p.name == l1Name &&
                     r.antecedent[1].p.name == l2Name) { already = true; break; }
             }
             if (already) continue;
 
-            // Synthesise the rule: IF X→λ₁→Y AND Y→λ₂→Z THEN X→λ₂→Z.
             Rule r;
             r.induced      = true;
             r.sourceLine   = -1;
-            r.supportCount = supp;
+            r.supportCount = rawSupp;
             r.counterCount = cex;
             TriplePattern a1, a2, c;
             a1.s = {true, "X"};   a1.p = {false, l1Name}; a1.o = {true, "Y"};
@@ -763,7 +1132,6 @@ static void runPSCTLoop(Graph& g) {
             psctTrace(g, "iter " + std::to_string(iter) + ": no new rules — loop terminates");
             break;
         }
-        // Re-run deduction so the new rules can fire and grow C.
         size_t chainsBefore = g.chains.size();
         evaluateRules(g);
         size_t newChains = g.chains.size() - chainsBefore;
@@ -1747,6 +2115,46 @@ int main(int argc, char** argv) {
         SDL_SetRenderDrawColor(ren, colBg.r, colBg.g, colBg.b, colBg.a);
         SDL_RenderClear(ren);
 
+        // G_full \ C: paths the analogy step explored but didn't commit.
+        // Render them first as dashed dim arrows so they sit underneath
+        // the contextual network.
+        if (!g.gfullChains.empty()) {
+            SDL_Color gfullCol{100, 120, 180, 90};
+            float inset = sim.nodeRadius * zoom + 1.f;
+            for (auto& gc : g.gfullChains) {
+                if (gc.nodeIds.size() < 2) continue;
+                for (size_t j = 0; j + 1 < gc.nodeIds.size(); ++j) {
+                    int sNode = gc.nodeIds[j];
+                    int oNode = gc.nodeIds[j + 1];
+                    if (sNode < 0 || oNode < 0) continue;
+                    if (sNode >= (int)g.nodes.size() || oNode >= (int)g.nodes.size()) continue;
+                    float ax, ay, bx, by;
+                    worldToScreen(g.nodes[sNode].x, g.nodes[sNode].y, ax, ay);
+                    worldToScreen(g.nodes[oNode].x, g.nodes[oNode].y, bx, by);
+                    float dx = bx - ax, dy = by - ay;
+                    float len = std::sqrt(dx*dx + dy*dy);
+                    if (len < 1.f) continue;
+                    float effLen = std::max(0.f, len - inset);
+                    float dashLen = 8.f * zoom, gapLen = 5.f * zoom;
+                    float t = 0.f;
+                    bool draw = true;
+                    SDL_SetRenderDrawColor(ren, gfullCol.r, gfullCol.g, gfullCol.b, gfullCol.a);
+                    while (t < effLen) {
+                        float segEnd = std::min(t + (draw ? dashLen : gapLen), effLen);
+                        if (draw) {
+                            SDL_RenderDrawLine(ren,
+                                (int)(ax + dx/len * t),
+                                (int)(ay + dy/len * t),
+                                (int)(ax + dx/len * segEnd),
+                                (int)(ay + dy/len * segEnd));
+                        }
+                        t = segEnd;
+                        draw = !draw;
+                    }
+                }
+            }
+        }
+
         // edges: draw each chain's edges in its own color. Shared edges
         // (the same edge index appearing in multiple chains) are offset
         // perpendicularly so every participating chain stays visible.
@@ -1890,7 +2298,17 @@ int main(int argc, char** argv) {
                     if (j) sentence += " ";
                     sentence += g.nodes[c.nodeIds[j]].id;
                 }
-                if (derived) sentence += "   (derived)";
+                float conf = (ci < (int)g.chainConfidence.size())
+                           ? g.chainConfidence[ci] : 1.0f;
+                if (derived) {
+                    if (conf < 0.999f) {
+                        char cbuf[40];
+                        std::snprintf(cbuf, sizeof(cbuf), "   [conf %.2f]", conf);
+                        sentence += cbuf;
+                    } else {
+                        sentence += "   (derived)";
+                    }
+                }
 
                 // Bullet in this chain's color so the user can match a row
                 // in the sidebar against the matching trace in the graph.
