@@ -3,7 +3,7 @@
 A small interactive **force-directed graph viewer** written in C++ with SDL2.
 Inspired by [Obsidian-Node-Network](https://github.com/ngchenghow/Obsidian-Node-Network) — same `subject->predicate->object` text format, rendered as a native desktop window instead of inside Obsidian. Edges are directed and rendered with arrowheads that land on the target node's border.
 
-![screenshot placeholder](docs/screenshot.png)
+<img width="1096" height="752" alt="image" src="https://github.com/user-attachments/assets/2c92070b-6320-4790-82bc-36d4618eb64a" />
 
 ## Graph syntax
 
